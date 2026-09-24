@@ -9,13 +9,16 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::removal::{
     Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
     detect_trash_backend, plan,
 };
 use disktree_core::scan::{ScanHandle, ScanOptions, ScanSnapshot};
-use disktree_core::space::{SpaceInfo, space_info};
-use disktree_core::tree::{Node, path_of};
+use disktree_core::space::{
+    SpaceInfo, device_for, space_info, volume_root_for,
+};
+use disktree_core::tree::{Metric, Node, path_of};
 use disktree_core::treemap::{
     LayoutOptions, Rect, Tile, TileKind, hit, layout,
 };
@@ -25,10 +28,50 @@ use gpui_kit::{
     Window, px, size,
 };
 use gpui_omarchy::Status;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+
+use crate::git::GitState;
 
 use crate::marks::{Marks, display_path, is_hidden};
 use crate::treemap_view::{Mosaic, TileDeco};
+
+/// What a tile's colour says.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColorMode {
+    /// The kind of data it is.
+    #[default]
+    Kind,
+    /// How long since anything in it was written.
+    Age,
+}
+
+/// What is scanned, as the trail's switch names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// The home directory.
+    Home,
+    /// The whole disk the home directory lives on.
+    Disk,
+}
+
+/// The side panel's width in rem: default and limits. In rem, so interface
+/// zoom scales it with everything it holds.
+pub const PANEL_REMS: f32 = 23.0;
+pub const PANEL_MIN_REMS: f32 = 17.0;
+pub const PANEL_MAX_REMS: f32 = 44.0;
+
+/// The panel width, in rem, for its left edge at `pointer_x` in a window
+/// `viewport` pixels wide: between its limits, and never so wide that the
+/// mosaic is squeezed below the panel's own minimum.
+pub fn panel_width(pointer_x: f32, viewport: f32, rem: f32) -> f32 {
+    let width = (viewport - pointer_x) / rem;
+    let max =
+        (viewport / rem - PANEL_MIN_REMS).clamp(PANEL_MIN_REMS, PANEL_MAX_REMS);
+    width.clamp(PANEL_MIN_REMS, max)
+}
+
+/// How many "worth a look" findings the panel lists.
+const INSIGHT_LIMIT: usize = 6;
 
 /// Which screen the app is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -296,6 +339,25 @@ pub struct Disktree {
     pub show_help: bool,
     pub show_selection: bool,
     pub focus: FocusHandle,
+
+    pub color_mode: ColorMode,
+    /// The largest things worth clearing, recomputed when a scan lands.
+    pub insights: Vec<Candidate>,
+    /// What git knows about each checkout that has been selected; `None`
+    /// once asked and found not to be one.
+    pub git: FxHashMap<PathBuf, Option<GitState>>,
+    git_pending: FxHashSet<PathBuf>,
+    /// The device the scanned volume is mounted from.
+    pub device: Option<String>,
+    /// The top of the disk the home directory lives on: what "Whole disk"
+    /// scans.
+    pub disk_root: Option<PathBuf>,
+    /// The side panel's width, in rem; dragged from its left edge.
+    pub panel_rems: f32,
+    pub scan_started: Option<Instant>,
+    pub scan_elapsed: Option<Duration>,
+    /// Unix seconds when the tree landed: the "now" ages are measured from.
+    pub scanned_at: i64,
 }
 
 impl Disktree {
@@ -357,7 +419,23 @@ impl Disktree {
             show_help: false,
             show_selection: true,
             focus: cx.focus_handle(),
+            color_mode: ColorMode::Kind,
+            insights: Vec::new(),
+            git: FxHashMap::default(),
+            git_pending: FxHashSet::default(),
+            device: None,
+            disk_root: None,
+            panel_rems: PANEL_REMS,
+            scan_started: None,
+            scan_elapsed: None,
+            scanned_at: now_seconds(),
         };
+        tree.device = device_for(&tree.root_path);
+        tree.disk_root = tree
+            .home
+            .as_deref()
+            .or(Some(tree.root_path.as_path()))
+            .and_then(volume_root_for);
         tree.start_scan(cx);
         Self::start_space_ticker(cx);
         tree
@@ -380,8 +458,75 @@ impl Disktree {
         app.marks.refresh(&app.root_path, &tree, app.options.metric);
         app.tree = Some(Rc::new(tree));
         app.cache = None;
+        app.refresh_insights();
         app.select_largest(cx);
         app
+    }
+
+    /// Which scope the current root is, if it is one of the two.
+    pub fn scope(&self) -> Option<Scope> {
+        if self.home.as_deref() == Some(self.root_path.as_path()) {
+            Some(Scope::Home)
+        } else if self.disk_root.as_deref() == Some(self.root_path.as_path()) {
+            Some(Scope::Disk)
+        } else {
+            None
+        }
+    }
+
+    /// Scan a different root: the home directory, the whole disk, or any
+    /// directory. Marks are kept; a mark outside the new root is shown as
+    /// kept back, never removed.
+    pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<'_, Self>) {
+        if root == self.root_path && self.tree.is_some() {
+            return;
+        }
+        self.space = space_info(&root).ok();
+        self.device = device_for(&root);
+        self.root_path = root;
+        self.screen = Screen::Explore;
+        self.start_scan(cx);
+    }
+
+    /// Switch to a scope.
+    pub fn set_scope(&mut self, scope: Scope, cx: &mut Context<'_, Self>) {
+        let root = match scope {
+            Scope::Home => self.home.clone(),
+            Scope::Disk => self.disk_root.clone(),
+        };
+        if let Some(root) = root {
+            self.set_root(root, cx);
+        }
+    }
+
+    /// Recompute "worth a look" from the tree on screen.
+    fn refresh_insights(&mut self) {
+        self.scanned_at = now_seconds();
+        self.insights = self.tree.as_deref().map_or_else(Vec::new, |tree| {
+            worth_a_look(tree, self.scanned_at, INSIGHT_LIMIT)
+        });
+    }
+
+    /// Ask git about `path` once, off the UI thread, if it is a checkout.
+    pub fn ensure_git(&mut self, path: &Path, cx: &Context<'_, Self>) {
+        if self.git.contains_key(path) || self.git_pending.contains(path) {
+            return;
+        }
+        let path = path.to_path_buf();
+        self.git_pending.insert(path.clone());
+        let task = cx.background_executor().spawn({
+            let path = path.clone();
+            async move { crate::git::state(&path) }
+        });
+        cx.spawn(async move |this, cx| {
+            let state = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.git_pending.remove(&path);
+                this.git.insert(path, state);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Select the largest entry of the current root, so the selection line, the
@@ -415,6 +560,10 @@ impl Disktree {
         self.hovered = None;
         self.view = View::default();
         self.cache = None;
+        self.insights.clear();
+        self.git.clear();
+        self.scan_started = Some(Instant::now());
+        self.scan_elapsed = None;
         self.scan = Some(ScanHandle::spawn(
             self.root_path.clone(),
             self.options.clone(),
@@ -465,6 +614,9 @@ impl Disktree {
                 self.marks.refresh(&self.root_path, &node, metric);
                 self.tree = Some(Rc::new(node));
                 self.cache = None;
+                self.refresh_insights();
+                self.scan_elapsed =
+                    self.scan_started.map(|started| started.elapsed());
                 self.keep_selection_valid();
                 self.select_largest(cx);
             }
@@ -716,6 +868,16 @@ impl Disktree {
         self.view = View::IDENTITY;
         self.transition = None;
         self.cache = None;
+        cx.notify();
+    }
+
+    /// Show `crumbs` in its directory, selected: what a "worth a look" row
+    /// or a found name does.
+    pub fn reveal(&mut self, crumbs: Vec<usize>, cx: &mut Context<'_, Self>) {
+        let parent = crumbs[..crumbs.len().saturating_sub(1)].to_vec();
+        self.go_to(parent, cx);
+        self.selected = Some(crumbs);
+        self.pointer_active = false;
         cx.notify();
     }
 
@@ -976,24 +1138,34 @@ impl Disktree {
             };
         };
 
-        // Colours are keyed to depth-from-the-scanned-root, not depth-from-this
-        // view: the layout root is re-based every time the view descends, so a
-        // view-relative key would recolour every tile as you walk in. The view
-        // root's own absolute depth is the breadcrumb count.
-        let base_depth = u32::try_from(self.crumbs.len()).unwrap_or(u32::MAX);
+        // Hue comes from the node's kind; lightness from its depth in this
+        // view, so the first level always reads as the first level.
+        let age = self.color_mode == ColorMode::Age;
+        let now = self.scanned_at;
         let mut decorations = Vec::with_capacity(tiles.len());
         let mut labels = Vec::new();
         for tile in &tiles {
             let crumbs = tile.crumbs();
-            let hidden = self.crumbs_are_hidden(crumbs);
+            let node = match &tile.kind {
+                TileKind::Node { crumbs } => self.node_at(crumbs),
+                TileKind::Others { .. } => None,
+            };
+            let category = node.map_or_else(Default::default, |n| n.category);
+            let age_bucket = (age && node.is_some_and(|n| n.modified > 0))
+                .then(|| {
+                    let days =
+                        (now - node.map_or(now, |n| n.modified)) / 86_400;
+                    crate::palette::age_bucket(days)
+                });
             let is_marked = marked.contains(crumbs);
             let is_covered = covered.contains(crumbs);
             decorations.push(TileDeco {
                 rect: self.animated_rect(tile.rect),
-                header: tile.header.map(|header| self.animated_rect(header)),
                 depth: tile.depth,
-                color_depth: base_depth.saturating_add(tile.depth),
-                hidden,
+                category,
+                age_bucket,
+                reclaimable: node.is_some_and(|n| n.reclaim.is_some()),
+                unreadable: node.is_some_and(|n| n.read_error),
                 marked: is_marked,
                 covered: is_covered,
                 hovered: hovered.as_deref() == Some(crumbs),
@@ -1023,7 +1195,7 @@ impl Disktree {
                         header: tile
                             .header
                             .map(|header| self.animated_rect(header)),
-                        color_depth: base_depth.saturating_add(tile.depth),
+                        depth: tile.depth,
                         marked: is_marked || is_covered,
                         size_text: crate::widgets::short_value(node, metric),
                     });
@@ -1032,7 +1204,7 @@ impl Disktree {
                     text: format!("+{count} more"),
                     rect: self.animated_rect(tile.rect),
                     header: None,
-                    color_depth: base_depth.saturating_add(tile.depth),
+                    depth: tile.depth,
                     marked: false,
                     size_text: String::new(),
                 }),
@@ -1077,21 +1249,12 @@ impl Disktree {
         Some(crumbs)
     }
 
-    /// Whether any component of the path to `crumbs` is a dotfile.
-    fn crumbs_are_hidden(&self, crumbs: &[usize]) -> bool {
-        let Some(tree) = &self.tree else {
-            return false;
-        };
-        tree.resolve_chain(crumbs)
-            .iter()
-            .any(|node| node.name.starts_with('.'))
-    }
-
     /// Tiles for the current root and viewport size, computed once per change.
     pub fn layout(&mut self) -> Option<&[Tile]> {
         // A 17 px band at the default rem, scaled so zoom keeps the band's
         // relationship to the label inside it.
         self.layout_options.header = HEADER_REMS * self.rem;
+        self.layout_options.header_inner = HEADER_INNER_REMS * self.rem;
         let area = self.treemap_size.get();
         let key = LayoutKey {
             crumbs: self.crumbs.clone(),
@@ -1217,8 +1380,34 @@ impl Disktree {
                 metric,
             );
         }
+        // Children are ordered by the metric, so every crumb moved.
+        self.refresh_insights();
         self.cache = None;
         cx.notify();
+    }
+
+    /// The Size | Files | Age choice: what areas measure, and what colour
+    /// says. Age keeps areas by size, since age has no area of its own.
+    pub fn set_mode(&mut self, index: usize, cx: &mut Context<'_, Self>) {
+        let (metric, color) = match index {
+            1 => (Metric::Files, ColorMode::Kind),
+            2 => (Metric::Bytes, ColorMode::Age),
+            _ => (Metric::Bytes, ColorMode::Kind),
+        };
+        self.color_mode = color;
+        if self.options.metric != metric {
+            self.toggle_metric(cx);
+        }
+        cx.notify();
+    }
+
+    /// The Size | Files | Age choice currently on.
+    pub const fn mode_index(&self) -> usize {
+        match (self.color_mode, self.options.metric) {
+            (ColorMode::Age, _) => 2,
+            (ColorMode::Kind, Metric::Files) => 1,
+            (ColorMode::Kind, Metric::Bytes) => 0,
+        }
     }
 
     // ── removal ─────────────────────────────────────────────────────────
@@ -1404,11 +1593,8 @@ impl Disktree {
             cx.notify();
             return;
         };
-        let parent = crumbs[..crumbs.len().saturating_sub(1)].to_vec();
-        self.go_to(parent, cx);
-        self.selected = Some(crumbs);
+        self.reveal(crumbs, cx);
         self.notice = None;
-        cx.notify();
     }
 
     // ── input ───────────────────────────────────────────────────────────
@@ -1595,8 +1781,18 @@ impl Disktree {
                 );
             }
             "0" => self.reset_view(cx),
-            "t" if !control => self.toggle_metric(cx),
+            "t" if !control => {
+                self.set_mode((self.mode_index() + 1) % 3, cx);
+            }
             "r" if !control => self.start_scan(cx),
+            "g" if !control => {
+                let next = if self.scope() == Some(Scope::Disk) {
+                    Scope::Home
+                } else {
+                    Scope::Disk
+                };
+                self.set_scope(next, cx);
+            }
             "i" if !control => {
                 self.options.include_hidden = !self.options.include_hidden;
                 self.start_scan(cx);
@@ -1661,6 +1857,21 @@ impl Disktree {
             event.position.x - origin.x,
             event.position.y - origin.y,
         );
+        // Moves are delivered here even when the pointer is elsewhere in the
+        // window. Outside the mosaic there is nothing to hover, and a stale
+        // tooltip would cover whatever the pointer went to — the panel's
+        // resize handle, for one.
+        let area = self.treemap_size.get();
+        let inside = local.x >= px(0.)
+            && local.y >= px(0.)
+            && local.x < area.width
+            && local.y < area.height;
+        if !inside {
+            if self.pointer.is_some() || self.hovered.is_some() {
+                self.on_mouse_leave(cx);
+            }
+            return;
+        }
         self.pointer = Some(local);
         self.pointer_active = true;
         let previous = self.hovered.clone();
@@ -1844,9 +2055,8 @@ pub struct Label {
     /// The band this label belongs in, when its tile reserved one. A parent's
     /// name goes in its own band, never over its children.
     pub header: Option<Rect>,
-    /// Depth from the scanned root, used for the colour so it does not shift
-    /// when the view descends.
-    pub color_depth: u32,
+    /// Nesting depth in this view: the first level is set in bold.
+    pub depth: u32,
     pub marked: bool,
     pub size_text: String,
 }
@@ -1854,8 +2064,20 @@ pub struct Label {
 /// How many labels one frame will shape.
 const MAX_LABELS: usize = 150;
 
-/// Height of a directory's name band, in rem.
-const HEADER_REMS: f32 = 1.0625;
+/// Height of a top-level directory's name band, in rem.
+const HEADER_REMS: f32 = 1.375;
+
+/// Height of the slim label row a deeper open directory keeps, in rem.
+const HEADER_INNER_REMS: f32 = 1.0;
+
+/// Now, in Unix seconds.
+pub fn now_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
 
 /// Smallest tile, in rem, that gets a label: below this a name cannot be read.
 const LABEL_MIN_W_REMS: f32 = 3.375;

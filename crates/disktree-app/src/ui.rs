@@ -47,6 +47,12 @@ pub mod text {
     pub const BODY: Rems = Rems(0.75);
     /// Window, section and dialog titles.
     pub const TITLE: Rems = Rems(0.875);
+    /// The app name and the selection's name.
+    pub const HEADING: Rems = Rems(1.125);
+    /// A figure worth reading from across the room: the free space.
+    pub const FIGURE: Rems = Rems(1.625);
+    /// The selection's size: the one number the panel exists to show.
+    pub const DISPLAY: Rems = Rems(2.5);
 }
 
 /// Icon slots, sized with the text they sit beside.
@@ -63,14 +69,16 @@ pub mod icon {
 pub mod size {
     use super::Rems;
 
-    /// The volume meter in the status bar.
-    pub const SPACE_METER: Rems = Rems(20.0);
-    /// The scan meter in the status bar.
-    pub const SCAN_METER: Rems = Rems(15.0);
+    /// A list row's share bar.
+    pub const ROW_BAR: Rems = Rems(5.5);
+    /// A legend or identity swatch.
+    pub const SWATCH: Rems = Rems(0.625);
+    /// A thin meter: share of the scan, the disk.
+    pub const METER: Rems = Rems(0.3125);
     /// The meter on the scanning panel.
     pub const SCANNING_METER: Rems = Rems(26.25);
-    /// The Size | Files choice in the settings row.
-    pub const RANKING_CHOICE: Rems = Rems(8.5);
+    /// The Size | Files | Age choice in the settings row.
+    pub const RANKING_CHOICE: Rems = Rems(11.0);
     /// The review screen's summary column.
     pub const REVIEW_SUMMARY: Rems = Rems(22.5);
     /// The review list's share-bar lane.

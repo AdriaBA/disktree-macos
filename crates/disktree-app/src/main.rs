@@ -5,6 +5,7 @@
 //! live free-space meter. Marking is non-destructive until the review screen
 //! is confirmed.
 
+mod git;
 mod marks;
 mod palette;
 mod state;
@@ -45,7 +46,10 @@ options:
   -a, --apparent-size   measure apparent length instead of allocated blocks
   -l, --follow-links    follow symlinks
   -H, --no-hidden       skip dotfiles and dot-directories
-  -x, --one-filesystem  do not cross filesystem boundaries
+  -D, --disk            scan the whole disk the home directory is on
+  -X, --cross-filesystems
+                        also measure other disks, network shares and pseudo
+                        filesystems mounted below PATH (off by default)
   -d, --depth N         how many levels to draw at once (1-6, default 3)
       --metric files    rank by file count instead of bytes
   -h, --help            show this help
@@ -120,6 +124,7 @@ fn parse_args() -> Result<Args> {
     let mut root: Option<PathBuf> = None;
     let mut options = ScanOptions::default();
     let mut depth = 3_u32;
+    let mut disk = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -131,7 +136,11 @@ fn parse_args() -> Result<Args> {
             "-a" | "--apparent-size" => options.apparent_size = true,
             "-l" | "--follow-links" => options.follow_links = true,
             "-H" | "--no-hidden" => options.include_hidden = false,
+            // Staying on one volume is the default; the flag is kept so
+            // old invocations still work.
             "-x" | "--one-filesystem" => options.one_filesystem = true,
+            "-X" | "--cross-filesystems" => options.one_filesystem = false,
+            "-D" | "--disk" => disk = true,
             "-d" | "--depth" => {
                 let value = args.next().context("--depth needs a number")?;
                 depth = value.parse().context("--depth needs a number")?;
@@ -160,7 +169,16 @@ fn parse_args() -> Result<Args> {
         }
     }
 
+    anyhow::ensure!(
+        !(disk && root.is_some()),
+        "--disk and a PATH cannot be combined"
+    );
+    let home = std::env::var_os("HOME").map(PathBuf::from);
     let root = match root {
+        _ if disk => home
+            .as_deref()
+            .and_then(disktree_core::space::volume_root_for)
+            .unwrap_or_else(|| PathBuf::from("/")),
         Some(root) => root,
         None => std::env::var_os("HOME")
             .map(PathBuf::from)

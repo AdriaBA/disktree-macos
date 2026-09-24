@@ -814,3 +814,100 @@ fn after_descending_every_tile_is_inside_the_directory_drawn(
     });
     assert_eq!(hatched, 1, "exactly the marked tile is hatched");
 }
+
+/// Drive the scan the view started until its tree lands.
+fn finish_scan(view: &Entity<Disktree>, cx: &mut Window) {
+    let epoch = read(view, cx, |app| app.scan_epoch);
+    for _ in 0..600 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let ready = update(view, cx, |app, cx| {
+            app.poll_scan_once(epoch, cx);
+            app.tree().is_some()
+        });
+        if ready {
+            return;
+        }
+    }
+    panic!("the scan never landed");
+}
+
+#[gpui_kit::test]
+fn dragging_the_panel_edge_resizes_it_within_its_limits(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::{PANEL_MAX_REMS, PANEL_MIN_REMS, panel_width};
+    use gpui_kit::{Modifiers, MouseButton};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let handle = cx.debug_bounds("panel-handle").expect("the panel is shown");
+    let start = handle.center();
+    let before = read(&view, cx, |app| app.panel_rems);
+
+    // A drag starts on the first move and reports moves after it, as a real
+    // pointer does in many small steps.
+    let drag = |cx: &mut Window, from: Point<Pixels>, to: Point<Pixels>| {
+        cx.simulate_mouse_down(from, MouseButton::Left, Modifiers::none());
+        for step in 1..=4 {
+            let t = step as f32 / 4.0;
+            let at = Point::new(from.x + (to.x - from.x) * t, to.y);
+            cx.simulate_mouse_move(
+                at,
+                Some(MouseButton::Left),
+                Modifiers::none(),
+            );
+        }
+        cx.simulate_mouse_up(to, MouseButton::Left, Modifiers::none());
+        draw(cx);
+    };
+
+    // Wider: drag the edge 160 px to the left.
+    let wider = Point::new(start.x - px(160.), start.y);
+    drag(cx, start, wider);
+    let after = read(&view, cx, |app| app.panel_rems);
+    assert!(
+        (after - before - 10.0).abs() < 0.5,
+        "160 px is 10 rem: {before} -> {after}"
+    );
+
+    // The limits, for any edge position: a minimum, a maximum, and never
+    // so wide that the mosaic gets less room than the panel's own minimum.
+    assert!((panel_width(1390., 1400., 16.) - PANEL_MIN_REMS).abs() < 1e-3);
+    assert!((panel_width(0., 3000., 16.) - PANEL_MAX_REMS).abs() < 1e-3);
+    let squeezed = panel_width(0., 800., 16.);
+    assert!((squeezed - (800. / 16. - PANEL_MIN_REMS)).abs() < 1e-3);
+    assert!((panel_width(0., 300., 16.) - PANEL_MIN_REMS).abs() < 1e-3);
+}
+
+#[gpui_kit::test]
+fn g_switches_between_the_home_directory_and_the_whole_disk(
+    cx: &mut TestAppContext,
+) {
+    use crate::state::Scope;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    // Stand-ins: the fixture is "home", a directory in it is "the disk".
+    let disk = temp.path().join("junk");
+    update(&view, cx, |app, _| {
+        app.home = Some(temp.path().to_path_buf());
+        app.disk_root = Some(disk.clone());
+    });
+    assert_eq!(read(&view, cx, Disktree::scope), Some(Scope::Home));
+
+    press(cx, "g");
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), disk);
+    assert!(read(&view, cx, |app| app.scan.is_some()), "a new scan runs");
+    finish_scan(&view, cx);
+    assert_eq!(read(&view, cx, Disktree::scope), Some(Scope::Disk));
+    let top = read(&view, cx, |app| app.tree().map(|tree| tree.bytes));
+    assert!(top.is_some_and(|bytes| bytes > 0));
+
+    press(cx, "g");
+    finish_scan(&view, cx);
+    assert_eq!(read(&view, cx, Disktree::scope), Some(Scope::Home));
+}

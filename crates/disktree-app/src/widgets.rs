@@ -35,14 +35,6 @@ pub fn short_value(node: &Node, metric: Metric) -> String {
     }
 }
 
-/// The value to show in tables and headers.
-pub fn value(node: &Node, metric: Metric) -> String {
-    match metric {
-        Metric::Bytes => human_bytes(node.bytes),
-        Metric::Files => format!("{} files", human_count(node.files)),
-    }
-}
-
 /// A dim label above a number, for the header strip.
 pub fn stat(
     label: impl Into<SharedString>,
@@ -344,4 +336,175 @@ pub fn crumb(
             this.hover(|style| style.bg(theme.hover_fill()))
         })
         .child(label.into())
+}
+
+/// A small uppercase label over a region or a figure.
+pub fn eyebrow(label: impl Into<SharedString>, cx: &App) -> Div {
+    let theme = cx.omarchy();
+    let label: SharedString = label.into();
+    div()
+        .text_size(text::CAPTION)
+        .text_color(theme.secondary.opacity(0.7))
+        .whitespace_nowrap()
+        .child(SharedString::from(label.to_uppercase()))
+}
+
+/// An eyebrow over a value, for the top bar and the selection grid.
+pub fn figure(
+    label: impl Into<SharedString>,
+    value: impl Into<SharedString>,
+    color: Hsla,
+    cx: &App,
+) -> Div {
+    div()
+        .flex()
+        .flex_col()
+        .gap(space::XXS)
+        .min_w_0()
+        .child(eyebrow(label, cx))
+        .child(
+            div()
+                .text_size(text::TITLE)
+                .text_color(color)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .child(value.into()),
+        )
+}
+
+/// A size split into number and unit, so the number can be set large:
+/// `90.1 GiB` is `("90.1", "GiB")`.
+pub fn split_size(text: &str) -> (String, String) {
+    text.split_once(' ').map_or_else(
+        || (text.to_string(), String::new()),
+        |(number, unit)| (number.to_string(), unit.to_string()),
+    )
+}
+
+/// How long ago a Unix time was, in the unit a person would use.
+pub fn ago(now: i64, then: i64) -> String {
+    if then <= 0 {
+        return "unknown".to_string();
+    }
+    let seconds = (now - then).max(0);
+    let plural = |count: i64, unit: &str| {
+        if count == 1 {
+            format!("1 {unit} ago")
+        } else {
+            format!("{count} {unit}s ago")
+        }
+    };
+    match seconds {
+        0..60 => "just now".to_string(),
+        60..3_600 => plural(seconds / 60, "minute"),
+        3_600..86_400 => plural(seconds / 3_600, "hour"),
+        86_400..5_184_000 => plural(seconds / 86_400, "day"),
+        5_184_000..63_072_000 => plural(seconds / 2_592_000, "month"),
+        _ => plural(seconds / 31_536_000, "year"),
+    }
+}
+
+/// A thin bar: `fraction` of a track, in `color`.
+pub fn bar(fraction: f32, color: Hsla, cx: &App) -> Div {
+    let theme = cx.omarchy();
+    div()
+        .relative()
+        .w_full()
+        .h(crate::ui::size::METER)
+        .bg(theme.foreground.opacity(0.08))
+        .child(
+            div()
+                .absolute()
+                .left_0()
+                .top_0()
+                .h_full()
+                .w(relative(fraction.clamp(0.0, 1.0)))
+                .bg(color),
+        )
+}
+
+/// A square of colour, for a legend or an identity.
+pub fn swatch(color: Hsla) -> Div {
+    div()
+        .flex_shrink_0()
+        .size(crate::ui::size::SWATCH)
+        .bg(color)
+}
+
+/// The hatch swatch that stands for reclaimable space in the legend.
+pub fn hatch_swatch(color: Hsla, ground: Hsla) -> Div {
+    div()
+        .flex_shrink_0()
+        .size(crate::ui::size::SWATCH)
+        .bg(ground)
+        .child(
+            div()
+                .size_full()
+                .bg(gpui_kit::pattern_slash(color, 1.0, 3.0)),
+        )
+}
+
+/// A large number followed by its small unit, sharing one baseline.
+///
+/// Flex baseline alignment does not line up text of different sizes here,
+/// so both are set on bottom-aligned boxes exactly one line tall, and the
+/// unit is lifted by the difference in their descents: a font's descent is
+/// close to a fifth of its size.
+pub fn measure(
+    number: impl Into<SharedString>,
+    number_size: gpui_kit::Rems,
+    unit: impl Into<SharedString>,
+    unit_size: gpui_kit::Rems,
+    cx: &App,
+) -> Div {
+    let theme = cx.omarchy();
+    let lift = gpui_kit::Rems((number_size.0 - unit_size.0) * DESCENT);
+    div()
+        .flex()
+        .flex_row()
+        .items_end()
+        .gap(space::SM)
+        .child(
+            div()
+                .text_size(number_size)
+                .line_height(number_size)
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme.bright)
+                .child(number.into()),
+        )
+        .child(
+            div()
+                .text_size(unit_size)
+                .line_height(unit_size)
+                .pb(lift)
+                .text_color(theme.secondary)
+                .whitespace_nowrap()
+                .child(unit.into()),
+        )
+}
+
+/// A font's descent as a share of its size, for lining up baselines.
+const DESCENT: f32 = 0.2;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ages_read_in_the_unit_a_person_would_use() {
+        let now = 1_800_000_000;
+        assert_eq!(ago(now, now - 5), "just now");
+        assert_eq!(ago(now, now - 120), "2 minutes ago");
+        assert_eq!(ago(now, now - 3_600), "1 hour ago");
+        assert_eq!(ago(now, now - 19 * 86_400), "19 days ago");
+        assert_eq!(ago(now, now - 90 * 86_400), "3 months ago");
+        assert_eq!(ago(now, now - 800 * 86_400), "2 years ago");
+        assert_eq!(ago(now, 0), "unknown");
+    }
+
+    #[test]
+    fn sizes_split_into_number_and_unit() {
+        assert_eq!(split_size("90.1 GiB"), ("90.1".into(), "GiB".into()));
+        assert_eq!(split_size("0"), ("0".into(), String::new()));
+    }
 }

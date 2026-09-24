@@ -4,30 +4,38 @@
 //! always exactly what the state says — there is no second copy of anything to
 //! keep in sync.
 
+use disktree_core::classify::Category;
+use disktree_core::insights::{Candidate, Finding, STALE_DAYS};
 use disktree_core::removal::{RemovalMode, Target};
 use disktree_core::size::human_bytes;
 use disktree_core::tree::Metric;
+use gpui_kit::base::CheckboxState;
 use gpui_kit::{
-    App, Context, Div, ElementId, FontWeight, InteractiveElement as _,
-    IntoElement, KeyDownEvent, ParentElement, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, Window, div, px,
+    App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
+    FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
+    ParentElement, Rems, SharedString, Stateful,
+    StatefulInteractiveElement as _, Styled, Window, div, pattern_slash, px,
+    relative,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, ChoiceItem, Theme, alert_dialog, button,
-    button_group, dialog_button, dialog_description, dialog_popup,
-    dialog_title, separator, toggle, with_tooltip,
+    button_group, checkbox, dialog_button, dialog_description, dialog_popup,
+    dialog_title, separator, with_tooltip,
 };
 
 use gpui_kit::prelude::FluentBuilder as _;
 
-use crate::state::{Disktree, Screen};
+use crate::palette;
+use crate::state::{
+    ColorMode, Disktree, PANEL_REMS, Scope, Screen, panel_width,
+};
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
 use crate::widgets;
 
 /// Width, in rem, at which the header holds title, settings and totals on one
 /// line. Narrower, the totals move into the status bar.
-const HEADER_WIDE_REMS: f32 = 62.0;
+const HEADER_WIDE_REMS: f32 = 86.0;
 
 /// How many marks the review screen lists. Everything above the cap is still
 /// removed; the list only stops being exhaustive, which it says out loud.
@@ -173,34 +181,1278 @@ fn explore(
 ) -> Div {
     let theme = cx.omarchy().clone();
     let mosaic: Mosaic = app.prepare();
-    let selection = app.show_selection;
-    // Below this width the header cannot hold title, settings and totals on
-    // one line; the totals move to the status bar rather than wrapping.
-    let wide =
-        window.viewport_size().width.as_f32() / app.rem >= HEADER_WIDE_REMS;
-    let header = explore_header(app, &theme, wide, window, cx);
-    let trail = breadcrumbs(app, &theme, cx);
+    let width_rems = window.viewport_size().width.as_f32() / app.rem;
+    let wide = width_rems >= HEADER_WIDE_REMS;
+    // The panel is where the selection, the marks and the disk live; it
+    // only gives way when the mosaic would be too narrow to read.
+    let panel = app.show_selection && width_rems >= PANEL_SHOWN_REMS;
+    if panel && let Some(path) = selection_checkout(app) {
+        app.ensure_git(&path, cx);
+    }
+
+    let viewport = if app.tree().is_none() {
+        // The first walk of a home directory takes long enough that an
+        // empty viewport would look broken; count the work instead.
+        scanning_panel(app, &theme, cx).into_any_element()
+    } else {
+        treemap_view::mosaic(mosaic, app, window, cx).into_any_element()
+    };
 
     div()
         .flex()
         .flex_col()
         .flex_1()
         .min_h_0()
-        .child(header)
-        .child(trail)
-        .child(div().flex().flex_row().flex_1().min_h_0().child(
-            if app.tree().is_none() {
-                // The first walk of a home directory takes long enough that
-                // an empty viewport would look broken; count the work
-                // instead of pretending there is nothing to see.
-                scanning_panel(app, &theme, cx).into_any_element()
-            } else {
-                treemap_view::mosaic(mosaic, app, window, cx).into_any_element()
+        .child(top_bar(app, &theme, wide, window, cx))
+        .child(
+            div()
+                .id("explore-body")
+                .flex()
+                .flex_row()
+                .flex_1()
+                .min_h_0()
+                // The panel's handle starts the drag; the width follows the
+                // pointer from here, wherever it goes in the window.
+                .on_drag_move(cx.listener(
+                    |this, event: &DragMoveEvent<PanelDrag>, window, cx| {
+                        this.panel_rems = panel_width(
+                            event.event.position.x.as_f32(),
+                            window.viewport_size().width.as_f32(),
+                            this.rem,
+                        );
+                        cx.notify();
+                    },
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .min_h_0()
+                        .child(trail_and_legend(app, &theme, cx))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_h_0()
+                                .px(space::LG)
+                                .pb(space::SM)
+                                .child(viewport),
+                        ),
+                )
+                .children(panel.then(|| side_panel(app, &theme, cx))),
+        )
+        .child(key_bar(app, &theme, cx))
+}
+
+/// The selection, when it is a checkout git can say something about.
+fn selection_checkout(app: &Disktree) -> Option<std::path::PathBuf> {
+    let target = app.action_target()?;
+    let node = app.node_at(&target)?;
+    if !node.is_dir() {
+        return None;
+    }
+    let path = app.path_at(&target)?;
+    crate::git::is_checkout(&path).then_some(path)
+}
+
+/// Width, in rem, below which the side panel gives the mosaic its room.
+const PANEL_SHOWN_REMS: f32 = 52.0;
+
+/// What the panel handle drags. The width itself lives in the app state.
+#[derive(Clone, Copy, Debug)]
+struct PanelDrag;
+
+/// A drag needs a view to draw under the pointer; resizing draws nothing.
+struct NoGhost;
+
+impl gpui_kit::Render for NoGhost {
+    fn render(
+        &mut self,
+        _: &mut Window,
+        _: &mut Context<'_, Self>,
+    ) -> impl IntoElement {
+        div()
+    }
+}
+
+// ── top bar ─────────────────────────────────────────────────────────────
+
+/// The app, what the whole scan found, and the controls that decide what
+/// is measured, on the edge they own.
+fn top_bar(
+    app: &Disktree,
+    theme: &Theme,
+    wide: bool,
+    window: &mut Window,
+    cx: &mut Context<'_, Disktree>,
+) -> Div {
+    let tree = app.tree();
+    let scanned = tree.map_or(app.progress.bytes, |node| node.bytes);
+    let files = tree.map_or(app.progress.files, |node| node.files);
+    let dirs = tree.map_or(app.progress.dirs, |node| node.dirs);
+    let errors = app.progress.errors;
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::LG)
+        .px(space::LG)
+        .py(space::MD)
+        .border_b_1()
+        .border_color(theme.divider())
+        .child(logo(theme))
+        // What is scanned sits with the name: the totals beside it are
+        // totals of this choice.
+        .child(scope_switch(app, window, cx));
+    if wide {
+        let value = |text: String| text;
+        row = row
+            .child(widgets::figure(
+                "Scanned",
+                value(human_bytes(scanned)),
+                theme.bright,
+                cx,
+            ))
+            .child(widgets::figure(
+                "Files",
+                widgets::human_count(files),
+                theme.bright,
+                cx,
+            ))
+            .child(widgets::figure(
+                "Dirs",
+                widgets::human_count(dirs),
+                theme.bright,
+                cx,
+            ))
+            .child(widgets::figure(
+                "Unreadable",
+                widgets::human_count(errors),
+                if errors > 0 {
+                    theme.warning
+                } else {
+                    theme.secondary
+                },
+                cx,
+            ));
+    }
+    row.child(div().flex_1())
+        .child(view_settings(app, window, cx))
+}
+
+/// Four tiles in category colours, and the name.
+fn logo(theme: &Theme) -> Div {
+    let tile = |category| {
+        div()
+            .size(space::SM)
+            .bg(palette::category_accent(theme, category))
+    };
+    let column = |top, bottom| {
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::XXS)
+            .child(tile(top))
+            .child(tile(bottom))
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .flex_shrink_0()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .gap(space::XXS)
+                .child(column(Category::Code, Category::Synced))
+                .child(column(Category::AgentScratch, Category::Toolchain)),
+        )
+        .child(
+            div()
+                .text_size(text::HEADING)
+                .font_weight(FontWeight::BOLD)
+                .text_color(theme.bright)
+                .child("disktree"),
+        )
+}
+
+/// How the mosaic is measured and drawn, as real controls with visible state.
+///
+/// Every control hands the keyboard straight back to the treemap: arrows,
+/// Space and Enter belong to the tiles, and a settings click must not quietly
+/// capture them.
+fn view_settings(
+    app: &Disktree,
+    window: &mut Window,
+    cx: &mut Context<'_, Disktree>,
+) -> Div {
+    let focus = app.focus.clone();
+    let entity = cx.entity().downgrade();
+
+    let mode = {
+        let entity = entity.clone();
+        let focus = focus.clone();
+        button_group(
+            "mode",
+            vec![
+                ChoiceItem::new("size", "Size"),
+                ChoiceItem::new("files", "Files"),
+                ChoiceItem::new("age", "Age"),
+            ],
+            Some(app.mode_index()),
+            move |index, window, cx| {
+                let _ = entity.update(cx, |this, cx| this.set_mode(index, cx));
+                window.focus(&focus, cx);
             },
+            window,
+            cx,
+        )
+        .w(size::RANKING_CHOICE)
+        // Tighter than a standalone group, so the segmented control shares
+        // the checkboxes' height and centre line.
+        .p(space::XXS)
+    };
+
+    let check = |on: bool| {
+        if on {
+            CheckboxState::Checked
+        } else {
+            CheckboxState::Unchecked
+        }
+    };
+    let hidden = {
+        let entity = entity.clone();
+        let focus = focus.clone();
+        checkbox(
+            "hidden",
+            "Hidden files",
+            check(app.options.include_hidden),
+            cx,
+        )
+        .tab_stop(false)
+        .on_change(move |_, _, window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.options.include_hidden = !this.options.include_hidden;
+                this.start_scan(cx);
+            });
+            window.focus(&focus, cx);
+        })
+    };
+    let apparent = {
+        checkbox(
+            "apparent",
+            "Apparent size",
+            check(app.options.apparent_size),
+            cx,
+        )
+        .tab_stop(false)
+        .on_change(move |_, _, window, cx| {
+            let _ = entity.update(cx, |this, cx| {
+                this.options.apparent_size = !this.options.apparent_size;
+                this.start_scan(cx);
+            });
+            window.focus(&focus, cx);
+        })
+    };
+
+    let theme = cx.omarchy().clone();
+    let depth = app.layout_options.max_depth;
+    let stepper = |id: &'static str,
+                   label: &'static str,
+                   step: i32,
+                   cx: &mut Context<'_, Disktree>| {
+        button(id, label, ButtonVariant::Secondary, cx)
+            .tab_stop(false)
+            .disabled(if step < 0 { depth <= 1 } else { depth >= 6 })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.adjust_depth(step, cx);
+                window.focus(&this.focus, cx);
+            }))
+    };
+    let depth_control = with_tooltip(
+        div()
+            .id("depth")
+            .flex()
+            .flex_row()
+            .items_center()
+            .border_1()
+            .border_color(theme.control_border())
+            .child(
+                div()
+                    .px(space::SM)
+                    .text_size(text::BODY)
+                    .text_color(theme.foreground)
+                    .child(format!("Depth {depth}")),
+            )
+            .child(stepper("depth-less", "\u{2212}", -1, cx))
+            .child(stepper("depth-more", "+", 1, cx)),
+        "Levels drawn at once \u{00b7} [ and ]",
+    );
+
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .flex_shrink_0()
+        .child(mode)
+        .child(hidden)
+        .child(apparent)
+        .child(depth_control)
+}
+
+// ── trail and legend ────────────────────────────────────────────────────
+
+/// Where you are, as a clickable trail, and what the colours mean, on one
+/// row over the mosaic.
+fn trail_and_legend(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let trail = app.breadcrumbs();
+    let last = trail.len().saturating_sub(1);
+    let mut crumbs = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::XXS)
+        .flex_shrink_0();
+    for (index, (label, path)) in trail.into_iter().enumerate() {
+        if index > 0 {
+            crumbs = crumbs.child(
+                div()
+                    .text_color(theme.secondary.opacity(0.5))
+                    .text_size(text::BODY)
+                    .child("/"),
+            );
+        }
+        let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
+        crumbs = crumbs.child(
+            widgets::crumb(id, label, index == last, cx).on_click(
+                cx.listener(move |this, _, _, cx| this.go_to(path.clone(), cx)),
+            ),
+        );
+    }
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::LG)
+        .px(space::LG)
+        .py(space::SM)
+        .child(crumbs);
+    if app.find_open || !app.find.is_empty() {
+        row = row.child(find_field(app, theme));
+    }
+    row.child(div().flex_1()).child(legend(app, theme, cx))
+}
+
+/// What is scanned: the home directory or the whole disk it lives on. A
+/// root given on the command line is neither, and selects nothing.
+fn scope_switch(
+    app: &Disktree,
+    window: &mut Window,
+    cx: &mut Context<'_, Disktree>,
+) -> impl IntoElement {
+    let entity = cx.entity().downgrade();
+    let focus = app.focus.clone();
+    let disk = app.disk_root.as_deref().map_or_else(
+        || "/ Whole disk".to_string(),
+        |root| format!("{} Whole disk", root.display()),
+    );
+    with_tooltip(
+        button_group(
+            "scope",
+            vec![
+                ChoiceItem::new("home", "~ Home"),
+                ChoiceItem::new("disk", disk),
+            ],
+            app.scope().map(|scope| usize::from(scope == Scope::Disk)),
+            move |index, window, cx| {
+                let _ = entity.update(cx, |this, cx| {
+                    this.set_scope(
+                        if index == 1 { Scope::Disk } else { Scope::Home },
+                        cx,
+                    );
+                });
+                window.focus(&focus, cx);
+            },
+            window,
+            cx,
+        )
+        .flex_shrink_0()
+        .p(space::XXS),
+        "What to scan · g switches",
+    )
+}
+
+/// The key to the colours: the categories, or the age ramp in age mode.
+/// Clipped from the trailing end when the row runs out of room.
+fn legend(app: &Disktree, theme: &Theme, cx: &App) -> Div {
+    let item = |swatch: Div, label: &'static str| {
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(space::XS)
+            .flex_shrink_0()
+            .child(swatch)
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(label),
+            )
+    };
+    let mut lane = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::MD)
+        .min_w_0()
+        .overflow_hidden();
+    if app.color_mode == ColorMode::Age {
+        for (bucket, (_, label)) in palette::AGE_BUCKETS.iter().enumerate() {
+            lane = lane.child(item(
+                widgets::swatch(palette::age_accent(theme, bucket)),
+                label,
+            ));
+        }
+    } else {
+        for category in Category::LEGEND {
+            lane = lane.child(item(
+                widgets::swatch(palette::category_accent(theme, category)),
+                category.label(),
+            ));
+        }
+    }
+    let ground = palette::category_fill(theme, Category::Other, 0);
+    let hatch = cx.omarchy().bright.opacity(0.5);
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::MD)
+        .min_w_0()
+        .overflow_hidden()
+        .child(item(widgets::hatch_swatch(hatch, ground), "Reclaimable"))
+        .child(lane)
+}
+
+// ── side panel ──────────────────────────────────────────────────────────
+
+/// Selection, worth a look, marked, and the disk: everything a decision
+/// needs, next to the mosaic rather than under it.
+fn side_panel(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let rule = || div().h(px(1.)).bg(theme.divider());
+    // A hairline to look at, a wider strip to grab; double-click resets.
+    let handle = div()
+        .id("panel-handle")
+        .debug_selector(|| "panel-handle".into())
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(px(-3.))
+        .w(px(6.))
+        .cursor_col_resize()
+        .hover(|style| style.bg(theme.accent.opacity(0.35)))
+        .on_drag(PanelDrag, |_, _, _, cx| cx.new(|_| NoGhost))
+        .on_click(cx.listener(|this, event: &ClickEvent, _, cx| {
+            if event.click_count() >= 2 {
+                this.panel_rems = PANEL_REMS;
+                cx.notify();
+            }
+        }));
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .gap(space::LG)
+        .w(Rems(app.panel_rems))
+        .flex_shrink_0()
+        .min_h_0()
+        .px(space::LG)
+        .py(space::LG)
+        .border_l_1()
+        .border_color(theme.divider())
+        .bg(theme.surface)
+        .child(handle)
+        .child(selection_section(app, theme, cx))
+        .child(rule())
+        // The lists scroll; the selection above and the disk below stay put,
+        // so the two numbers that matter never leave the screen.
+        .child(
+            div()
+                .id("panel-lists")
+                .flex()
+                .flex_col()
+                .gap(space::LG)
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .child(worth_section(app, theme, cx))
+                .child(rule())
+                .child(marked_section(app, theme, cx)),
+        )
+        .children(notice_line(app, theme, cx))
+        .child(disk_section(app, theme, cx))
+}
+
+/// What the keys act on: its name and place, its size set large with its
+/// share of the scan, when it was last written, what git says, and the two
+/// things to do with it.
+fn selection_section(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let section = div()
+        .flex()
+        .flex_col()
+        .gap(space::MD)
+        .child(widgets::eyebrow("Selection", cx));
+    let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
+    let Some(node) = app.node_at(&target) else {
+        return section.child(
+            div()
+                .text_color(theme.secondary)
+                .child("Point at a tile or select one with the arrows"),
+        );
+    };
+    let path = app.path_at(&target);
+    let root_value = app.tree().map_or(0, |tree| tree.bytes);
+    let marked = path.as_deref().is_some_and(|path| app.marks.contains(path));
+    let covered_by = marks_ancestor(app, path.as_deref());
+    let is_current_root = target == app.crumbs;
+    let highlight = palette::highlight(theme);
+
+    let identity = div()
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .min_w_0()
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .min_w_0()
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(space::XS)
+                        .h(text::HEADING)
+                        .bg(palette::category_accent(theme, node.category)),
+                )
+                .child(
+                    div()
+                        .text_size(text::HEADING)
+                        .font_weight(FontWeight::BOLD)
+                        .text_color(theme.bright)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(node.name.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(path.as_deref().map_or_else(String::new, |path| {
+                    crate::marks::display_path(path, app.home.as_deref())
+                })),
+        );
+
+    let (number, unit) = match app.options.metric {
+        Metric::Bytes => widgets::split_size(&human_bytes(node.bytes)),
+        Metric::Files => (widgets::human_count(node.files), "files".into()),
+    };
+    let share = node.bytes as f32 / root_value.max(1) as f32;
+    let measure = div()
+        .flex()
+        .flex_col()
+        .gap(space::SM)
+        .child(widgets::measure(
+            number,
+            text::DISPLAY,
+            unit,
+            text::TITLE,
+            cx,
         ))
-        .children(selection.then(|| selection_bar(app, &theme, cx)))
-        .child(status_bar(app, &theme, !wide, cx))
-        .child(hint_bar(app, &theme, cx))
+        .child(widgets::bar(share, highlight, cx));
+
+    let fourth = if node.is_dir()
+        && let Some(path) = &path
+        && crate::git::is_checkout(path)
+    {
+        let value = match app.git.get(path) {
+            Some(Some(state)) => state.summary(),
+            Some(None) => "not readable".to_string(),
+            None => "asking\u{2026}".to_string(),
+        };
+        let clean =
+            matches!(app.git.get(path), Some(Some(state)) if state.is_clean());
+        widgets::figure(
+            "Git",
+            value,
+            if clean { theme.success } else { theme.bright },
+            cx,
+        )
+    } else {
+        let kind = node.reclaim.map_or_else(
+            || node.category.label().to_string(),
+            |reason| {
+                format!("{} \u{00b7} {}", node.category.label(), reason.label())
+            },
+        );
+        widgets::figure("Kind", kind, theme.bright, cx)
+    };
+    let grid = div()
+        .flex()
+        .flex_col()
+        .gap(space::MD)
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .child(div().flex_1().min_w_0().child(widgets::figure(
+                    "Of scan",
+                    widgets::percent(node.bytes, root_value),
+                    theme.bright,
+                    cx,
+                )))
+                .child(div().flex_1().min_w_0().child(widgets::figure(
+                    "Files",
+                    widgets::human_count(node.files),
+                    theme.bright,
+                    cx,
+                ))),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .child(div().flex_1().min_w_0().child(widgets::figure(
+                    "Last write",
+                    widgets::ago(crate::state::now_seconds(), node.modified),
+                    theme.bright,
+                    cx,
+                )))
+                .child(div().flex_1().min_w_0().child(fourth)),
+        );
+
+    // Only states that change the decision earn a badge.
+    let mut chips = Vec::new();
+    if marked {
+        chips.push(widgets::chip("Marked", theme.danger, cx));
+    }
+    if let Some(ancestor) = &covered_by {
+        chips.push(widgets::chip(
+            format!("Inside marked {ancestor}"),
+            theme.secondary,
+            cx,
+        ));
+    }
+    if node.read_error {
+        chips.push(widgets::chip("Partly unreadable", theme.warning, cx));
+    }
+    let badges = (!chips.is_empty()).then(|| {
+        div()
+            .flex()
+            .flex_row()
+            .flex_wrap()
+            .gap(space::XS)
+            .children(chips)
+    });
+
+    // Open is secondary: Enter already does it. Marking is the action this
+    // tool exists for, so it takes the highlight.
+    let mut actions = div().flex().flex_row().gap(space::SM);
+    if !is_current_root {
+        if node.is_dir() {
+            let crumbs = target.clone();
+            actions = actions.child(
+                button("open", "Open", ButtonVariant::Outline, cx)
+                    .tab_stop(false)
+                    .flex_1()
+                    .justify_center()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.go_to(crumbs.clone(), cx);
+                        window.focus(&this.focus, cx);
+                    })),
+            );
+        }
+        let crumbs = target;
+        let mark = button(
+            "mark",
+            if marked { "Unmark" } else { "Mark for removal" },
+            ButtonVariant::Primary,
+            cx,
+        )
+        .tab_stop(false)
+        .flex_1()
+        .justify_center()
+        .on_click(cx.listener(move |this, _, window, cx| {
+            this.toggle_mark(&crumbs.clone(), cx);
+            window.focus(&this.focus, cx);
+        }));
+        actions = actions.child(if marked {
+            mark
+        } else {
+            let on = palette::on_highlight(theme);
+            mark.bg(highlight)
+                .border_color(highlight)
+                .text_color(on)
+                .font_weight(FontWeight::SEMIBOLD)
+                .hover(move |style| {
+                    style.bg(highlight.opacity(0.85)).border_color(highlight)
+                })
+        });
+    }
+
+    section
+        .child(identity)
+        .child(measure)
+        .child(grid)
+        .children(badges)
+        .child(actions)
+}
+
+/// The biggest things that could plausibly go, with their total.
+fn worth_section(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let total: u64 = app.insights.iter().map(|candidate| candidate.bytes).sum();
+    let largest = app.insights.first().map_or(1, |candidate| candidate.bytes);
+    let highlight = palette::highlight(theme);
+    let mut section = div().flex().flex_col().gap(space::XS).child(
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .pb(space::XS)
+            .child(widgets::eyebrow("Worth a look", cx))
+            .when(total > 0, |this| {
+                this.child(
+                    div()
+                        .text_size(text::CAPTION)
+                        .text_color(highlight)
+                        .child(human_bytes(total)),
+                )
+            }),
+    );
+    if app.insights.is_empty() {
+        return section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(if app.tree().is_some() {
+                    "Nothing obviously disposable"
+                } else {
+                    "Waiting for the scan"
+                }),
+        );
+    }
+    let selected = app.action_target();
+    for (index, candidate) in app.insights.iter().enumerate() {
+        let Some(node) = app.node_at(&candidate.crumbs) else {
+            continue;
+        };
+        let (title, detail) = insight_text(app, candidate);
+        let accent = palette::category_accent(theme, node.category);
+        let active = selected.as_deref() == Some(candidate.crumbs.as_slice());
+        let crumbs = candidate.crumbs.clone();
+        section = section.child(
+            div()
+                .id(ElementId::Name(format!("insight-{index}").into()))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .px(space::SM)
+                .py(space::XS)
+                .when(active, |this| this.bg(theme.hover_fill()))
+                .hover(|style| style.bg(theme.hover_fill()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.reveal(crumbs.clone(), cx);
+                    window.focus(&this.focus, cx);
+                }))
+                .child(div().flex_shrink_0().w(px(2.)).h(space::XL).bg(accent))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .text_size(text::BODY)
+                                .text_color(theme.bright)
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(title),
+                        )
+                        .child(
+                            div()
+                                .text_size(text::CAPTION)
+                                .text_color(theme.secondary.opacity(0.8))
+                                .whitespace_nowrap()
+                                .overflow_hidden()
+                                .text_ellipsis()
+                                .child(detail),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .items_end()
+                        .gap(space::XS)
+                        .flex_shrink_0()
+                        .w(size::ROW_BAR)
+                        .child(
+                            div()
+                                .text_size(text::BODY)
+                                .text_color(theme.bright)
+                                .child(human_bytes(candidate.bytes)),
+                        )
+                        .child(widgets::bar(
+                            candidate.bytes as f32 / largest.max(1) as f32,
+                            accent,
+                            cx,
+                        )),
+                ),
+        );
+    }
+    section
+}
+
+/// A finding's title, as the last two parts of its path, and why it is on
+/// the list.
+fn insight_text(app: &Disktree, candidate: &Candidate) -> (String, String) {
+    let tree = app.tree();
+    let chain = tree
+        .map_or_else(Vec::new, |tree| tree.resolve_chain(&candidate.crumbs));
+    let names: Vec<&str> =
+        chain.iter().skip(1).map(|node| &*node.name).collect();
+    let tail = names[names.len().saturating_sub(2)..].join("/");
+    match &candidate.finding {
+        Finding::Reclaimable(reason) => (tail, reason.label().to_string()),
+        Finding::Worktrees { count, oldest_days } => (
+            tail,
+            format!(
+                "{count} worktree{} \u{00b7} oldest {oldest_days} d",
+                if *count == 1 { "" } else { "s" }
+            ),
+        ),
+        Finding::StaleExperiments { count } => (
+            format!("{tail} > {STALE_DAYS} days"),
+            format!(
+                "{count} experiment{} untouched",
+                if *count == 1 { "" } else { "s" }
+            ),
+        ),
+    }
+}
+
+/// What is queued for removal, each with a way off the list.
+fn marked_section(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let plan = app.plan();
+    let count = app.marks.len();
+    let header = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(widgets::eyebrow(
+            if count == 0 {
+                "Marked".to_string()
+            } else {
+                format!("Marked · {count}")
+            },
+            cx,
+        ))
+        .when(count > 0, |this| {
+            this.child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary)
+                    .child(human_bytes(plan.bytes())),
+            )
+        });
+    let mut section = div().flex().flex_col().gap(space::XS).child(header);
+    if count == 0 {
+        return section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child("Space marks the tile you point at"),
+        );
+    }
+    for (index, item) in app.marks.items().iter().take(MARKED_ROWS).enumerate()
+    {
+        let category = app
+            .crumbs_for_path(&item.path)
+            .and_then(|crumbs| app.node_at(&crumbs))
+            .map_or(Category::Other, |node| node.category);
+        let path = item.path.clone();
+        section = section.child(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::SM)
+                .text_size(text::CAPTION)
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .size(space::SM)
+                        .rounded_full()
+                        .bg(palette::category_accent(theme, category)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme.foreground)
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(crate::marks::display_path(
+                            &item.path,
+                            app.home.as_deref(),
+                        )),
+                )
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(theme.secondary)
+                        .child(human_bytes(item.bytes)),
+                )
+                .child(
+                    div()
+                        .id(ElementId::Name(format!("unmark-{index}").into()))
+                        .flex_shrink_0()
+                        .px(space::XS)
+                        .text_color(theme.secondary.opacity(0.7))
+                        .hover(|style| style.text_color(theme.danger))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.unmark(&path, cx);
+                            window.focus(&this.focus, cx);
+                        }))
+                        .child("\u{00d7}"),
+                ),
+        );
+    }
+    if count > MARKED_ROWS {
+        section = section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!(
+                    "+{} more on the review screen",
+                    count - MARKED_ROWS
+                )),
+        );
+    }
+    if !plan.covered.is_empty() || !plan.blocked.is_empty() {
+        section = section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!(
+                    "{} nested \u{00b7} {} kept back",
+                    plan.covered.len(),
+                    plan.blocked.len()
+                )),
+        );
+    }
+    section
+}
+
+/// Marked rows the panel lists before pointing at the review screen.
+const MARKED_ROWS: usize = 6;
+
+/// The last thing that happened, or a scan error, above the disk.
+fn notice_line(app: &Disktree, theme: &Theme, cx: &App) -> Option<Div> {
+    let (message, color) = if let Some(error) = &app.scan_error {
+        (error.clone(), theme.danger)
+    } else {
+        let (message, status) = app.notice.as_ref()?;
+        (message.clone(), widgets::alert_color(*status, cx))
+    };
+    Some(
+        div()
+            .px(space::SM)
+            .py(space::XS)
+            .border_1()
+            .border_color(color.opacity(0.5))
+            .text_color(color)
+            .text_size(text::CAPTION)
+            .child(message),
+    )
+}
+
+/// Free space on the volume now, and after the marks go.
+fn disk_section(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    let device = app.device.clone().unwrap_or_default();
+    let mut section = div().flex().flex_col().gap(space::SM).child(
+        div()
+            .flex()
+            .flex_row()
+            .gap(space::SM)
+            .child(widgets::eyebrow("Disk", cx))
+            .child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(theme.secondary.opacity(0.6))
+                    .child(device),
+            ),
+    );
+    let Some(space_info) = app.space else {
+        return section.child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child("Free space is not available here"),
+        );
+    };
+    let reclaiming = app.plan().bytes();
+    let after = space_info.after_removing(reclaiming);
+    let highlight = palette::highlight(theme);
+    let (number, unit) =
+        widgets::split_size(&human_bytes(space_info.available));
+    let total = space_info.total.max(1) as f32;
+    let used_now = (space_info.used() as f32 / total).clamp(0.0, 1.0);
+    let used_after = (after.used() as f32 / total).clamp(0.0, used_now);
+
+    section = section.child(
+        div()
+            .flex()
+            .flex_row()
+            .items_end()
+            .child(widgets::measure(
+                number,
+                text::FIGURE,
+                format!("{unit} free"),
+                text::BODY,
+                cx,
+            ))
+            .child(div().flex_1())
+            .when(reclaiming > 0, |this| {
+                // Lifted like the unit beside the figure, onto its baseline.
+                this.child(
+                    div()
+                        .text_size(text::TITLE)
+                        .line_height(text::TITLE)
+                        .pb(gpui_kit::Rems(
+                            (text::FIGURE.0 - text::TITLE.0) * 0.2,
+                        ))
+                        .text_color(highlight)
+                        .child(format!(
+                            "→ {} free",
+                            human_bytes(after.available)
+                        )),
+                )
+            }),
+    );
+    // Used space from the left; the slice the marks give back is the hatched
+    // end of it, so the gap it leaves is exactly what comes back.
+    section = section.child(
+        div()
+            .relative()
+            .w_full()
+            .h(space::SM)
+            .bg(theme.foreground.opacity(0.08))
+            .child(
+                div()
+                    .absolute()
+                    .left_0()
+                    .top_0()
+                    .h_full()
+                    .w(relative(used_after))
+                    .bg(theme.foreground.opacity(0.28)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(relative(used_after))
+                    .top_0()
+                    .h_full()
+                    .w(relative(used_now - used_after))
+                    .bg(highlight.opacity(0.25))
+                    .child(
+                        div()
+                            .size_full()
+                            .bg(pattern_slash(highlight, 1.0, 3.0)),
+                    ),
+            ),
+    );
+    section
+        .child(
+            div()
+                .flex()
+                .flex_row()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!("{} used", human_bytes(space_info.used())))
+                .child(div().flex_1())
+                .child(format!("{} total", human_bytes(space_info.total))),
+        )
+        .children(
+            (!app.marks.is_empty())
+                .then(|| review_button(app, reclaiming, theme, cx)),
+        )
+}
+
+/// The way to the review screen, where the saving is: it says what is
+/// marked and what it frees, so the number that matters is the thing to
+/// press. Outlined in the highlight, so it does not compete with the filled
+/// "Mark for removal" above it.
+fn review_button(
+    app: &Disktree,
+    reclaiming: u64,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> impl IntoElement {
+    let highlight = palette::highlight(theme);
+    let count = app.marks.len();
+    div()
+        .id("review")
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .mt(space::XS)
+        .px(space::MD)
+        .py(space::SM)
+        .border_1()
+        .border_color(highlight)
+        .bg(highlight.opacity(0.1))
+        .hover(move |style| style.bg(highlight.opacity(0.18)))
+        .active(move |style| style.bg(highlight.opacity(0.26)))
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.screen = Screen::Review;
+            cx.notify();
+            window.focus(&this.focus, cx);
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_size(text::BODY)
+                .text_color(highlight)
+                .whitespace_nowrap()
+                .overflow_hidden()
+                .text_ellipsis()
+                .child(format!(
+                    "Review {count} marked · frees {}…",
+                    human_bytes(reclaiming)
+                )),
+        )
+        .child(gpui_omarchy::keycap("c", cx))
+}
+
+// ── key bar ─────────────────────────────────────────────────────────────
+
+/// The keys, quietly: outlines and light labels, there when needed. The key
+/// to every other key and the scan's own numbers hold the trailing edge.
+fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
+    // Most useful first, so a narrow window clips the least useful.
+    let hints: [(&str, &str); 10] = [
+        ("space", "mark"),
+        ("enter", "open"),
+        ("\u{232b}", "up"),
+        ("c", "review"),
+        ("hjkl", "move"),
+        ("/", "find"),
+        ("[ ]", "depth"),
+        ("t", "mode"),
+        ("0", "reset"),
+        ("r", "rescan"),
+    ];
+    let mut lane = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::LG)
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden();
+    for (keys, label) in hints {
+        lane = lane.child(widgets::hint(keys, label, cx).flex_shrink_0());
+    }
+
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::LG)
+        .px(space::LG)
+        .py(space::XS)
+        .border_t_1()
+        .border_color(theme.divider())
+        .child(lane);
+    if (app.view.scale - 1.0).abs() > 0.01 {
+        row = row.child(
+            div()
+                .flex_shrink_0()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .child(format!("{:.1}\u{00d7}", app.view.scale)),
+        );
+    }
+    let scan = if app.scan.is_some() {
+        format!(
+            "scanning \u{00b7} {} entries \u{00b7} {}",
+            widgets::human_count(app.progress.files),
+            human_bytes(app.progress.bytes)
+        )
+    } else {
+        let elapsed = app.scan_elapsed.map_or_else(String::new, |time| {
+            format!(" \u{00b7} {:.1} s", time.as_secs_f32())
+        });
+        format!(
+            "scan {} entries{elapsed}",
+            widgets::human_count(app.progress.files)
+        )
+    };
+    row.child(widgets::hint("?", "all keys", cx).flex_shrink_0())
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.7))
+                .child(scan),
+        )
 }
 
 /// What the viewport shows while the first scan is running.
@@ -283,54 +1535,6 @@ fn scanning_panel(app: &Disktree, theme: &Theme, cx: &gpui_kit::App) -> Div {
     panel
 }
 
-fn explore_header(
-    app: &Disktree,
-    theme: &Theme,
-    wide: bool,
-    window: &mut Window,
-    cx: &mut Context<'_, Disktree>,
-) -> Div {
-    let tree = app.tree();
-    let scanned = tree.map_or(0, |node| node.bytes);
-    let files = tree.map_or(0, |node| node.files);
-    let dirs = tree.map_or(0, |node| node.dirs);
-
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::MD)
-        .px(space::LG)
-        .py(space::MD)
-        // Leading: the app and what the whole scan found. Trailing: the
-        // controls that decide what is measured, on the edge they own. The
-        // breadcrumb below names only the place.
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_size(text::TITLE)
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.bright)
-                .child("disktree"),
-        );
-    if wide {
-        row = row
-            .child(div().w(space::MD))
-            .child(widgets::stat("Scanned", human_bytes(scanned), cx))
-            .child(widgets::stat("Files", widgets::human_count(files), cx))
-            .child(widgets::stat(
-                "Directories",
-                widgets::human_count(dirs),
-                cx,
-            ));
-    }
-    row = row.child(div().flex_1());
-    if app.find_open || !app.find.is_empty() {
-        row = row.child(find_field(app, theme));
-    }
-    row.child(view_settings(app, window, cx))
-}
-
 fn find_field(app: &Disktree, theme: &Theme) -> Div {
     div()
         .flex()
@@ -361,317 +1565,6 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         })
 }
 
-fn breadcrumbs(
-    app: &Disktree,
-    theme: &Theme,
-    cx: &Context<'_, Disktree>,
-) -> Div {
-    let trail = app.breadcrumbs();
-    let last = trail.len().saturating_sub(1);
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::XXS)
-        .px(space::LG)
-        .py(space::SM)
-        .min_h_0()
-        .border_b_1()
-        .border_color(theme.divider());
-
-    for (index, (label, crumbs)) in trail.into_iter().enumerate() {
-        if index > 0 {
-            row = row.child(
-                div()
-                    .text_color(theme.secondary.opacity(0.6))
-                    .text_size(text::CAPTION)
-                    .child("/"),
-            );
-        }
-        let active = index == last;
-        let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
-        row = row.child(widgets::crumb(id, label, active, cx).on_click(
-            cx.listener(move |this, _, _, cx| this.go_to(crumbs.clone(), cx)),
-        ));
-    }
-
-    row
-}
-
-/// How the mosaic is measured and drawn, as real controls with visible state.
-///
-/// Every control hands the keyboard straight back to the treemap: arrows,
-/// Space and Enter belong to the tiles, and a settings click must not quietly
-/// capture them.
-fn view_settings(
-    app: &Disktree,
-    window: &mut Window,
-    cx: &mut Context<'_, Disktree>,
-) -> Div {
-    let focus = app.focus.clone();
-    let entity = cx.entity().downgrade();
-
-    let ranking = {
-        let entity = entity.clone();
-        let focus = focus.clone();
-        button_group(
-            "ranking",
-            vec![
-                ChoiceItem::new("bytes", "Size"),
-                ChoiceItem::new("files", "Files"),
-            ],
-            Some(usize::from(app.options.metric == Metric::Files)),
-            move |index, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    let wanted = if index == 0 {
-                        Metric::Bytes
-                    } else {
-                        Metric::Files
-                    };
-                    if this.options.metric != wanted {
-                        this.toggle_metric(cx);
-                    }
-                });
-                window.focus(&focus, cx);
-            },
-            window,
-            cx,
-        )
-        .w(size::RANKING_CHOICE)
-        // Tighter than a standalone group, so the segmented control shares
-        // the toggles' height and centre line in this toolbar row.
-        .p(space::XXS)
-    };
-
-    let hidden = {
-        let entity = entity.clone();
-        let focus = focus.clone();
-        toggle("hidden", "Hidden files", app.options.include_hidden, cx)
-            .tab_stop(false)
-            .on_change(move |_, _, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    this.options.include_hidden = !this.options.include_hidden;
-                    this.start_scan(cx);
-                });
-                window.focus(&focus, cx);
-            })
-    };
-
-    let apparent = {
-        toggle("apparent", "Apparent size", app.options.apparent_size, cx)
-            .tab_stop(false)
-            .on_change(move |_, _, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    this.options.apparent_size = !this.options.apparent_size;
-                    this.start_scan(cx);
-                });
-                window.focus(&focus, cx);
-            })
-    };
-
-    let depth = app.layout_options.max_depth;
-    let levels = with_tooltip(
-        button(
-            "levels",
-            format!("{depth} levels"),
-            // Outline, like the toggles beside it: bare text reads as a label.
-            ButtonVariant::Outline,
-            cx,
-        )
-        .tab_stop(false)
-        .on_click(cx.listener(|this, _, window, cx| {
-            // Cycles, so the pointer can reach every depth; the keys step.
-            let step = if this.layout_options.max_depth >= 6 {
-                -5
-            } else {
-                1
-            };
-            this.adjust_depth(step, cx);
-            window.focus(&this.focus, cx);
-        })),
-        "Levels drawn at once \u{00b7} [ and ]",
-    );
-
-    div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::SM)
-        .child(ranking)
-        .child(hidden)
-        .child(apparent)
-        .child(levels)
-}
-
-/// What the keys act on, as one line above the status bar: name and path,
-/// size and share, and the two actions that apply to it. The mosaic keeps the
-/// full width of the window.
-fn selection_bar(
-    app: &Disktree,
-    theme: &Theme,
-    cx: &Context<'_, Disktree>,
-) -> Div {
-    let target = app.action_target().unwrap_or_else(|| app.crumbs.clone());
-    let row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::XL)
-        .px(space::LG)
-        .py(space::SM)
-        .border_t_1()
-        .border_color(theme.divider())
-        .bg(theme.surface);
-
-    let Some(node) = app.node_at(&target) else {
-        return row.child(
-            div()
-                .text_color(theme.secondary)
-                .child("Point at a tile or select one with the arrows"),
-        );
-    };
-    let path = app.path_at(&target);
-    let parent = target[..target.len().saturating_sub(1)].to_vec();
-    let parent_value = app.node_at(&parent).map_or(0, |node| node.bytes);
-    let root_value = app.tree().map_or(0, |tree| tree.bytes);
-    let marked = path.as_deref().is_some_and(|path| app.marks.contains(path));
-    let covered_by = marks_ancestor(app, path.as_deref());
-    let is_current_root = target == app.crumbs;
-
-    // Identity: the lane that shrinks, so a long path truncates instead of
-    // pushing the actions off the edge.
-    let identity = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::SM)
-        .flex_1()
-        .min_w_0()
-        .child(
-            gpui_omarchy::icon(if node.is_dir() {
-                gpui_omarchy::IconName::FolderOpen
-            } else {
-                gpui_omarchy::IconName::File
-            })
-            .size(icon::MD)
-            .flex_shrink_0()
-            .text_color(theme.secondary),
-        )
-        .child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(space::XXS)
-                .min_w_0()
-                .overflow_hidden()
-                .child(
-                    div()
-                        .text_size(text::TITLE)
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme.bright)
-                        .whitespace_nowrap()
-                        .child(node.name.to_string()),
-                )
-                .child(
-                    div()
-                        .text_size(text::CAPTION)
-                        .text_color(theme.secondary)
-                        .whitespace_nowrap()
-                        .child(path.as_deref().map_or_else(
-                            String::new,
-                            |path| {
-                                crate::marks::display_path(
-                                    path,
-                                    app.home.as_deref(),
-                                )
-                            },
-                        )),
-                ),
-        );
-
-    // Badges stay neutral unless the state is a real deletion or warning.
-    let mut badges = div().flex().flex_row().gap(space::XS).flex_shrink_0();
-    if node.name.starts_with('.') {
-        badges = badges.child(widgets::chip("Hidden", theme.secondary, cx));
-    }
-    if marked {
-        badges = badges.child(widgets::chip("Marked", theme.danger, cx));
-    }
-    if let Some(ancestor) = &covered_by {
-        badges = badges.child(widgets::chip(
-            format!("Inside marked {ancestor}"),
-            theme.secondary,
-            cx,
-        ));
-    }
-    if node.read_error {
-        badges = badges.child(widgets::chip("Unreadable", theme.warning, cx));
-    }
-
-    // Measure: the size, then its share, then what it holds.
-    let measure = div()
-        .flex()
-        .flex_col()
-        .gap(space::XXS)
-        .flex_shrink_0()
-        .items_end()
-        .child(
-            div()
-                .text_size(text::TITLE)
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme.bright)
-                .child(widgets::value(node, app.options.metric)),
-        )
-        .child(
-            div()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(format!(
-                    "{} of its directory \u{00b7} {} of the scan \u{00b7} {} files",
-                    widgets::percent(node.bytes, parent_value),
-                    widgets::percent(node.bytes, root_value),
-                    widgets::human_count(node.files),
-                )),
-        );
-
-    // One primary, only where it is what Enter does. Marking is reversible,
-    // so it is framed but neither primary nor danger. Both hand the keyboard
-    // back to the treemap.
-    let mut actions = div().flex().flex_row().gap(space::SM).flex_shrink_0();
-    if !is_current_root && node.is_dir() {
-        let crumbs = target.clone();
-        actions = actions.child(
-            button("open", "Open", ButtonVariant::Primary, cx)
-                .tab_stop(false)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.go_to(crumbs.clone(), cx);
-                    window.focus(&this.focus, cx);
-                })),
-        );
-    }
-    if !is_current_root {
-        let crumbs = target;
-        actions = actions.child(
-            button(
-                "mark",
-                if marked { "Unmark" } else { "Mark for removal" },
-                ButtonVariant::Outline,
-                cx,
-            )
-            .tab_stop(false)
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.toggle_mark(&crumbs.clone(), cx);
-                window.focus(&this.focus, cx);
-            })),
-        );
-    }
-
-    row.child(identity)
-        .child(badges)
-        .child(measure)
-        .child(actions)
-}
-
 fn short_name(path: &std::path::Path) -> String {
     path.file_name().map_or_else(
         || path.display().to_string(),
@@ -693,171 +1586,6 @@ fn marks_ancestor(
         .next()
 }
 
-/// The volume and the marks: what was found, what it will free, and the
-/// command that acts on the marks, next to the marks it acts on.
-fn status_bar(
-    app: &Disktree,
-    theme: &Theme,
-    show_totals: bool,
-    cx: &Context<'_, Disktree>,
-) -> Div {
-    let plan = app.plan();
-    let reclaiming = plan.bytes();
-    let marked = app.marks.len();
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::LG)
-        .px(space::LG)
-        .py(space::SM)
-        .border_t_1()
-        .border_color(theme.divider())
-        .bg(theme.surface);
-
-    row =
-        row.child(div().w(size::SPACE_METER).flex_shrink_0().when_some(
-            app.space,
-            |this, space| {
-                this.child(widgets::space_meter(space, reclaiming, cx))
-            },
-        ));
-
-    row = row.child(
-        div()
-            .flex()
-            .flex_col()
-            .gap(space::XXS)
-            .child(widgets::stat_colored(
-                "Marked for removal",
-                if marked == 0 {
-                    "Nothing marked".to_string()
-                } else {
-                    format!(
-                        "{marked} items \u{00b7} {}",
-                        human_bytes(reclaiming)
-                    )
-                },
-                if marked > 0 {
-                    theme.danger
-                } else {
-                    theme.secondary
-                },
-                cx,
-            ))
-            .child(
-                div()
-                    .text_size(text::CAPTION)
-                    .text_color(theme.secondary)
-                    .child(if marked == 0 {
-                        "Space marks the tile you point at".to_string()
-                    } else if !plan.covered.is_empty()
-                        || !plan.blocked.is_empty()
-                    {
-                        format!(
-                            "{} nested \u{00b7} {} kept back",
-                            plan.covered.len(),
-                            plan.blocked.len()
-                        )
-                    } else if app.removal_mode == RemovalMode::Trash {
-                        "Will move to the trash".to_string()
-                    } else {
-                        "Will delete permanently".to_string()
-                    }),
-            ),
-    );
-
-    if marked > 0 {
-        row = row.child(
-            button("review", "Review\u{2026}", ButtonVariant::Secondary, cx)
-                .tab_stop(false)
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.screen = Screen::Review;
-                    cx.notify();
-                    window.focus(&this.focus, cx);
-                })),
-        );
-    }
-
-    row = row.child(div().flex_1());
-
-    if app.scan.is_some() {
-        let progress = &app.progress;
-        row = row.child(
-            div()
-                .flex()
-                .flex_col()
-                .gap(space::XS)
-                .w(size::SCAN_METER)
-                .child(
-                    div()
-                        .text_size(text::CAPTION)
-                        .text_color(theme.secondary)
-                        .child(format!(
-                            "Scanning \u{00b7} {} files \u{00b7} {}",
-                            widgets::human_count(progress.files),
-                            human_bytes(progress.bytes)
-                        )),
-                )
-                .child(widgets::meter_row(
-                    "",
-                    "",
-                    progress_estimate(progress.files),
-                    theme.accent,
-                    cx,
-                )),
-        );
-    } else {
-        if show_totals && let Some(tree) = app.tree() {
-            row = row.child(widgets::stat(
-                "Scanned",
-                human_bytes(tree.bytes),
-                cx,
-            ));
-        }
-        row = row.child(widgets::stat(
-            "Entries read",
-            widgets::human_count(app.progress.files),
-            cx,
-        ));
-        if app.progress.errors > 0 {
-            row = row.child(widgets::stat_colored(
-                "Unreadable",
-                format!("{} paths", app.progress.errors),
-                theme.warning,
-                cx,
-            ));
-        }
-    }
-
-    if let Some((message, status)) = &app.notice {
-        row = row.child(
-            div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap(space::SM)
-                .px(space::SM)
-                .py(space::XS)
-                .border_1()
-                .border_color(widgets::alert_color(*status, cx).opacity(0.5))
-                .text_color(widgets::alert_color(*status, cx))
-                .text_size(text::CAPTION)
-                .child(message.clone()),
-        );
-    }
-    if let Some(error) = &app.scan_error {
-        row = row.child(
-            div()
-                .text_color(theme.danger)
-                .text_size(text::CAPTION)
-                .child(error.clone()),
-        );
-    }
-
-    row
-}
-
 /// A scan has no total to measure against, so the meter shows the work done
 /// rather than pretending to know how far along it is.
 fn progress_estimate(files: u64) -> f32 {
@@ -868,57 +1596,6 @@ fn progress_estimate(files: u64) -> f32 {
         let scaled = files as f32 / (files as f32 + 20_000.0);
         (0.1 + scaled * 0.85).min(0.99)
     }
-}
-
-fn hint_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
-    // Most useful first, so a narrow window clips the least useful. The key
-    // to every other key is pinned to the trailing edge and never clipped.
-    let hints: [(&str, &str); 10] = [
-        ("space", "mark"),
-        ("enter", "open"),
-        ("\u{232b}", "up"),
-        ("c", "review"),
-        ("\u{2190}\u{2191}\u{2193}\u{2192}", "move"),
-        ("/", "find"),
-        ("scroll", "zoom"),
-        ("[ ]", "levels"),
-        ("0", "reset"),
-        ("r", "rescan"),
-    ];
-    let mut lane = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::LG)
-        .flex_1()
-        .min_w_0()
-        .overflow_hidden();
-    for (keys, label) in hints {
-        lane = lane.child(widgets::hint(keys, label, cx).flex_shrink_0());
-    }
-
-    let mut row = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::LG)
-        .px(space::LG)
-        .py(space::SM)
-        .border_t_1()
-        .border_color(theme.divider())
-        .bg(theme.background)
-        .child(lane);
-    // The magnification only earns space when it is not the default.
-    if (app.view.scale - 1.0).abs() > 0.01 {
-        row = row.child(
-            div()
-                .flex_shrink_0()
-                .text_size(text::CAPTION)
-                .text_color(theme.secondary)
-                .child(format!("{:.1}\u{00d7}", app.view.scale)),
-        );
-    }
-    row.child(widgets::hint("?", "all keys", cx).flex_shrink_0())
 }
 
 // ── review ──────────────────────────────────────────────────────────────
@@ -1803,7 +2480,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 23] = [
+    let rows: [(&str, &str); 24] = [
         ("space / x", "Mark or unmark the tile you point at"),
         ("ctrl-click", "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
@@ -1820,8 +2497,9 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("ctrl = / - / 0", "Interface zoom"),
         ("/", "Find an entry by name"),
         ("c", "Review the marked list"),
-        ("t", "Rank by size or by file count"),
+        ("t", "Size, files or age: what areas and colours say"),
         ("r", "Scan again from the same root"),
+        ("g", "Scan the home directory or the whole disk"),
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
         ("p", "Show or hide the selection line"),
