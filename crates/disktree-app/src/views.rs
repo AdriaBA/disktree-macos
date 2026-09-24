@@ -27,7 +27,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 
 use crate::palette;
 use crate::state::{
-    ColorMode, Disktree, PANEL_REMS, Scope, Screen, panel_width,
+    ColorMode, Crumb, Disktree, PANEL_REMS, Screen, panel_width,
 };
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
@@ -35,7 +35,7 @@ use crate::widgets;
 
 /// Width, in rem, at which the header holds title, settings and totals on one
 /// line. Narrower, the totals move into the status bar.
-const HEADER_WIDE_REMS: f32 = 86.0;
+const HEADER_WIDE_REMS: f32 = 74.0;
 
 /// How many marks the review screen lists. Everything above the cap is still
 /// removed; the list only stops being exhaustive, which it says out loud.
@@ -303,10 +303,7 @@ fn top_bar(
         .py(space::MD)
         .border_b_1()
         .border_color(theme.divider())
-        .child(logo(theme))
-        // What is scanned sits with the name: the totals beside it are
-        // totals of this choice.
-        .child(scope_switch(app, window, cx));
+        .child(logo(theme));
     if wide {
         let value = |text: String| text;
         row = row
@@ -523,8 +520,10 @@ fn trail_and_legend(
         .items_center()
         .gap(space::XXS)
         .flex_shrink_0();
-    for (index, (label, path)) in trail.into_iter().enumerate() {
-        if index > 0 {
+    let widening = app.scan.is_some() && app.scan_root != app.root_path;
+    for (index, (label, step)) in trail.into_iter().enumerate() {
+        // The root is its own separator: "/" then "home", not "/ / home".
+        if index > 1 {
             crumbs = crumbs.child(
                 div()
                     .text_color(theme.secondary.opacity(0.5))
@@ -533,11 +532,31 @@ fn trail_and_legend(
             );
         }
         let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
-        crumbs = crumbs.child(
-            widgets::crumb(id, label, index == last, cx).on_click(
-                cx.listener(move |this, _, _, cx| this.go_to(path.clone(), cx)),
-            ),
-        );
+        let crumb = match step {
+            // Above the scan: dimmer, and a click widens the scan to there.
+            Crumb::Above(path) => {
+                let pending = widening && app.scan_root == path;
+                with_tooltip(
+                    widgets::crumb(id, label, false, cx)
+                        .text_color(if pending {
+                            palette::highlight(theme)
+                        } else {
+                            theme.secondary.opacity(0.7)
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.widen_to(path.clone(), cx);
+                        })),
+                    "Scan from here · what is below is reused",
+                )
+                .into_any_element()
+            }
+            Crumb::Tree(path) => widgets::crumb(id, label, index == last, cx)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.go_to(path.clone(), cx);
+                }))
+                .into_any_element(),
+        };
+        crumbs = crumbs.child(crumb);
     }
 
     let mut row = div()
@@ -552,45 +571,6 @@ fn trail_and_legend(
         row = row.child(find_field(app, theme));
     }
     row.child(div().flex_1()).child(legend(app, theme, cx))
-}
-
-/// What is scanned: the home directory or the whole disk it lives on. A
-/// root given on the command line is neither, and selects nothing.
-fn scope_switch(
-    app: &Disktree,
-    window: &mut Window,
-    cx: &mut Context<'_, Disktree>,
-) -> impl IntoElement {
-    let entity = cx.entity().downgrade();
-    let focus = app.focus.clone();
-    let disk = app.disk_root.as_deref().map_or_else(
-        || "/ Whole disk".to_string(),
-        |root| format!("{} Whole disk", root.display()),
-    );
-    with_tooltip(
-        button_group(
-            "scope",
-            vec![
-                ChoiceItem::new("home", "~ Home"),
-                ChoiceItem::new("disk", disk),
-            ],
-            app.scope().map(|scope| usize::from(scope == Scope::Disk)),
-            move |index, window, cx| {
-                let _ = entity.update(cx, |this, cx| {
-                    this.set_scope(
-                        if index == 1 { Scope::Disk } else { Scope::Home },
-                        cx,
-                    );
-                });
-                window.focus(&focus, cx);
-            },
-            window,
-            cx,
-        )
-        .flex_shrink_0()
-        .p(space::XXS),
-        "What to scan · g switches",
-    )
 }
 
 /// The key to the colours: the categories, or the age ramp in age mode.
@@ -1393,7 +1373,7 @@ fn key_bar(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         ("\u{232b}", "up"),
         ("c", "review"),
         ("hjkl", "move"),
-        ("/", "find"),
+        ("/", "filter"),
         ("[ ]", "depth"),
         ("t", "mode"),
         ("0", "reset"),
@@ -1536,6 +1516,31 @@ fn scanning_panel(app: &Disktree, theme: &Theme, cx: &gpui_kit::App) -> Div {
 }
 
 fn find_field(app: &Disktree, theme: &Theme) -> Div {
+    // What the text matches, said beside it as it is typed, and what Enter
+    // and Escape will do with it.
+    let (summary, hint) = match app.matches.as_deref() {
+        _ if app.finding && app.matches.is_none() => {
+            ("searching…".to_string(), "")
+        }
+        None => (String::new(), "type to filter"),
+        Some(matches) if matches.count == 0 => {
+            ("no matches".to_string(), "esc clears")
+        }
+        Some(matches) => (
+            format!(
+                "{} match{} · {}",
+                widgets::human_count(matches.count as u64),
+                if matches.count == 1 { "" } else { "es" },
+                human_bytes(matches.bytes)
+            ),
+            if app.filter_applied {
+                "esc clears"
+            } else {
+                "enter shows only these"
+            },
+        ),
+    };
+    let highlight = palette::highlight(theme);
     div()
         .flex()
         .flex_row()
@@ -1543,9 +1548,12 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         .gap(space::SM)
         .px(space::SM)
         .py(space::XS)
+        .min_w_0()
         .border_1()
         .border_color(if app.find_open {
             theme.accent
+        } else if app.filter_applied {
+            highlight
         } else {
             theme.control_border()
         })
@@ -1554,15 +1562,39 @@ fn find_field(app: &Disktree, theme: &Theme) -> Div {
         .child(
             gpui_omarchy::icon(gpui_omarchy::IconName::Search)
                 .size(icon::SM)
-                .text_color(theme.secondary),
+                .text_color(if app.filter_applied {
+                    highlight
+                } else {
+                    theme.secondary
+                }),
         )
         .child(if app.find.is_empty() {
             div()
                 .text_color(theme.secondary.opacity(0.7))
-                .child("Find by name")
+                .child("Filter by name")
         } else {
             div().text_color(theme.bright).child(app.find.clone())
         })
+        .when(!summary.is_empty(), |this| {
+            this.child(
+                div()
+                    .text_size(text::CAPTION)
+                    .text_color(if app.filter_applied {
+                        highlight
+                    } else {
+                        theme.secondary
+                    })
+                    .whitespace_nowrap()
+                    .child(summary),
+            )
+        })
+        .child(
+            div()
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.6))
+                .whitespace_nowrap()
+                .child(hint),
+        )
 }
 
 fn short_name(path: &std::path::Path) -> String {
@@ -2495,11 +2527,14 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("[ / ]", "Draw fewer or more levels at once"),
         ("- / = / 0", "Magnify, shrink, or reset the view"),
         ("ctrl = / - / 0", "Interface zoom"),
-        ("/", "Find an entry by name"),
+        (
+            "/",
+            "Filter by name: only matches keep their colour; enter shows only them",
+        ),
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),
         ("r", "Scan again from the same root"),
-        ("g", "Scan the home directory or the whole disk"),
+        ("g", "The whole disk; click any directory above to widen"),
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
         ("p", "Show or hide the selection line"),

@@ -7,20 +7,22 @@
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use disktree_core::filter::{Keep, Matches, filter};
 use disktree_core::insights::{Candidate, worth_a_look};
 use disktree_core::removal::{
     Plan, RemovalEvent, RemovalHandle, RemovalMode, Target, TrashBackend,
     detect_trash_backend, plan,
 };
-use disktree_core::scan::{ScanHandle, ScanOptions, ScanSnapshot};
+use disktree_core::scan::{Known, ScanHandle, ScanOptions, ScanSnapshot};
 use disktree_core::space::{
     SpaceInfo, device_for, space_info, volume_root_for,
 };
 use disktree_core::tree::{Metric, Node, path_of};
 use disktree_core::treemap::{
-    LayoutOptions, Rect, Tile, TileKind, hit, layout,
+    LayoutOptions, Rect, Tile, TileKind, hit, layout_filtered,
 };
 use gpui_kit::{
     Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
@@ -45,13 +47,14 @@ pub enum ColorMode {
     Age,
 }
 
-/// What is scanned, as the trail's switch names it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Scope {
-    /// The home directory.
-    Home,
-    /// The whole disk the home directory lives on.
-    Disk,
+/// One step of the trail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Crumb {
+    /// A directory above the scanned root: going there scans only what is
+    /// new at that level.
+    Above(PathBuf),
+    /// A directory in the tree, by crumbs from the scanned root.
+    Tree(Vec<usize>),
 }
 
 /// The side panel's width in rem: default and limits. In rem, so interface
@@ -265,6 +268,8 @@ struct LayoutKey {
     width: f32,
     height: f32,
     options: LayoutOptions,
+    /// Bumped whenever the applied filter changes.
+    filter: u64,
 }
 
 /// Result of the removal run, summarised for the final screen.
@@ -282,7 +287,7 @@ pub struct Disktree {
     pub root_path: PathBuf,
     pub home: Option<PathBuf>,
     pub options: ScanOptions,
-    pub tree: Option<Rc<Node>>,
+    pub tree: Option<Arc<Node>>,
     pub scan: Option<ScanHandle>,
     pub scan_epoch: u64,
     pub progress: ScanSnapshot,
@@ -336,6 +341,18 @@ pub struct Disktree {
 
     pub find: String,
     pub find_open: bool,
+    /// What the find text matches in the directory on screen, recomputed
+    /// on every keystroke. While typing it only dims what does not match.
+    pub matches: Option<Arc<Matches>>,
+    /// Enter was pressed: the mosaic lays out only the matches.
+    pub filter_applied: bool,
+    filter_epoch: u64,
+    /// Bumped per keystroke; only the newest search's result is kept.
+    find_epoch: u64,
+    /// A search is running off the UI thread.
+    pub finding: bool,
+    /// Enter was pressed before the search finished: apply on arrival.
+    apply_pending: bool,
     pub show_help: bool,
     pub show_selection: bool,
     pub focus: FocusHandle,
@@ -355,6 +372,9 @@ pub struct Disktree {
     /// The side panel's width, in rem; dragged from its left edge.
     pub panel_rems: f32,
     pub scan_started: Option<Instant>,
+    /// Where the scan in flight is rooted. Differs from `root_path` while
+    /// widening, when the old tree stays on screen until the wider one lands.
+    pub scan_root: PathBuf,
     pub scan_elapsed: Option<Duration>,
     /// Unix seconds when the tree landed: the "now" ages are measured from.
     pub scanned_at: i64,
@@ -416,6 +436,12 @@ impl Disktree {
             notice: None,
             find: String::new(),
             find_open: false,
+            matches: None,
+            filter_applied: false,
+            filter_epoch: 0,
+            find_epoch: 0,
+            finding: false,
+            apply_pending: false,
             show_help: false,
             show_selection: true,
             focus: cx.focus_handle(),
@@ -427,6 +453,7 @@ impl Disktree {
             disk_root: None,
             panel_rems: PANEL_REMS,
             scan_started: None,
+            scan_root: PathBuf::new(),
             scan_elapsed: None,
             scanned_at: now_seconds(),
         };
@@ -456,31 +483,16 @@ impl Disktree {
     ) -> Self {
         let mut app = Self::new(root_path, options, depth, cx);
         app.marks.refresh(&app.root_path, &tree, app.options.metric);
-        app.tree = Some(Rc::new(tree));
+        app.tree = Some(Arc::new(tree));
         app.cache = None;
         app.refresh_insights();
         app.select_largest(cx);
         app
     }
 
-    /// Which scope the current root is, if it is one of the two.
-    pub fn scope(&self) -> Option<Scope> {
-        if self.home.as_deref() == Some(self.root_path.as_path()) {
-            Some(Scope::Home)
-        } else if self.disk_root.as_deref() == Some(self.root_path.as_path()) {
-            Some(Scope::Disk)
-        } else {
-            None
-        }
-    }
-
-    /// Scan a different root: the home directory, the whole disk, or any
-    /// directory. Marks are kept; a mark outside the new root is shown as
-    /// kept back, never removed.
+    /// Scan a different root from scratch. Marks are kept; a mark outside
+    /// the new root is shown as kept back, never removed.
     pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<'_, Self>) {
-        if root == self.root_path && self.tree.is_some() {
-            return;
-        }
         self.space = space_info(&root).ok();
         self.device = device_for(&root);
         self.root_path = root;
@@ -488,14 +500,52 @@ impl Disktree {
         self.start_scan(cx);
     }
 
-    /// Switch to a scope.
-    pub fn set_scope(&mut self, scope: Scope, cx: &mut Context<'_, Self>) {
-        let root = match scope {
-            Scope::Home => self.home.clone(),
-            Scope::Disk => self.disk_root.clone(),
+    /// Go up to `above`, a directory containing the scanned root.
+    ///
+    /// Memoized: the tree already measured is handed to the walk and reused
+    /// where it is reached, so only what is new at the wider level is read,
+    /// and the current view stays on screen until the wider tree lands.
+    pub fn widen_to(&mut self, above: PathBuf, cx: &mut Context<'_, Self>) {
+        let Some(tree) = self.tree.clone() else {
+            self.set_root(above, cx);
+            return;
         };
-        if let Some(root) = root {
-            self.set_root(root, cx);
+        if !self.root_path.starts_with(&above) || self.root_path == above {
+            return;
+        }
+        if let Some(scan) = &self.scan {
+            scan.cancel();
+        }
+        self.scan_epoch += 1;
+        let epoch = self.scan_epoch;
+        self.progress = ScanSnapshot::default();
+        self.scan_error = None;
+        self.scan_started = Some(Instant::now());
+        self.scan_elapsed = None;
+        self.scan_root.clone_from(&above);
+        let known = Known {
+            path: self.root_path.clone(),
+            tree,
+        };
+        self.scan = Some(ScanHandle::spawn_with(
+            above,
+            self.options.clone(),
+            Some(known),
+        ));
+        Self::poll_scan(epoch, cx);
+        cx.notify();
+    }
+
+    /// `g`: the whole disk. Widens when the disk is above the scanned root,
+    /// and goes to its top when it already is the root.
+    pub fn go_to_disk(&mut self, cx: &mut Context<'_, Self>) {
+        let Some(disk) = self.disk_root.clone() else {
+            return;
+        };
+        if disk == self.root_path {
+            self.go_to(Vec::new(), cx);
+        } else {
+            self.widen_to(disk, cx);
         }
     }
 
@@ -562,8 +612,10 @@ impl Disktree {
         self.cache = None;
         self.insights.clear();
         self.git.clear();
+        self.clear_filter();
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
+        self.scan_root.clone_from(&self.root_path);
         self.scan = Some(ScanHandle::spawn(
             self.root_path.clone(),
             self.options.clone(),
@@ -610,13 +662,33 @@ impl Disktree {
         };
         match outcome {
             Ok(node) => {
+                // A widening scan lands on a new root: move the view up to it,
+                // with the directory it came from selected.
+                let came_from = (self.scan_root != self.root_path)
+                    .then(|| self.root_path.clone());
+                if came_from.is_some() {
+                    self.clear_filter();
+                    self.root_path.clone_from(&self.scan_root);
+                    self.space = space_info(&self.root_path).ok();
+                    self.device = device_for(&self.root_path);
+                }
                 let metric = self.options.metric;
                 self.marks.refresh(&self.root_path, &node, metric);
-                self.tree = Some(Rc::new(node));
+                self.tree = Some(Arc::new(node));
                 self.cache = None;
                 self.refresh_insights();
                 self.scan_elapsed =
                     self.scan_started.map(|started| started.elapsed());
+                if let Some(from) = came_from {
+                    let crumbs = self.crumbs_for_path(&from);
+                    self.crumbs.clear();
+                    self.view = View::default();
+                    self.transition = None;
+                    self.forget_hover();
+                    self.selected = crumbs.and_then(|crumbs| {
+                        crumbs.first().map(|&top| vec![top])
+                    });
+                }
                 self.keep_selection_valid();
                 self.select_largest(cx);
             }
@@ -704,11 +776,19 @@ impl Disktree {
     }
 
     /// Breadcrumb labels from the scanned root to the current directory.
-    pub fn breadcrumbs(&self) -> Vec<(String, Vec<usize>)> {
-        let mut trail = vec![(
-            display_path(&self.root_path, self.home.as_deref()),
-            Vec::new(),
-        )];
+    /// The trail, from `/`: the directories above the scanned root, which
+    /// widen the scan, then the root and the path into the tree.
+    pub fn breadcrumbs(&self) -> Vec<(String, Crumb)> {
+        let mut trail: Vec<(String, Crumb)> = self
+            .root_path
+            .ancestors()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|path| (crumb_label(path), Crumb::Above(path.to_path_buf())))
+            .collect();
+        trail.push((crumb_label(&self.root_path), Crumb::Tree(Vec::new())));
         let Some(tree) = &self.tree else {
             return trail;
         };
@@ -720,7 +800,7 @@ impl Disktree {
                 break;
             };
             crumbs.push(index);
-            trail.push((node.name.to_string(), crumbs.clone()));
+            trail.push((node.name.to_string(), Crumb::Tree(crumbs.clone())));
         }
         trail
     }
@@ -1157,6 +1237,12 @@ impl Disktree {
                         (now - node.map_or(now, |n| n.modified)) / 86_400;
                     crate::palette::age_bucket(days)
                 });
+            let filtered = match self.matches.as_deref().map(|m| m.keep(crumbs))
+            {
+                None | Some(Some(Keep::Whole)) => Filtered::Shown,
+                Some(Some(Keep::Partial { .. })) => Filtered::Holds,
+                Some(None) => Filtered::Out,
+            };
             let is_marked = marked.contains(crumbs);
             let is_covered = covered.contains(crumbs);
             decorations.push(TileDeco {
@@ -1165,6 +1251,7 @@ impl Disktree {
                 category,
                 age_bucket,
                 reclaimable: node.is_some_and(|n| n.reclaim.is_some()),
+                filtered,
                 unreadable: node.is_some_and(|n| n.read_error),
                 marked: is_marked,
                 covered: is_covered,
@@ -1196,6 +1283,7 @@ impl Disktree {
                             .header
                             .map(|header| self.animated_rect(header)),
                         depth: tile.depth,
+                        dim: filtered == Filtered::Out,
                         marked: is_marked || is_covered,
                         size_text: crate::widgets::short_value(node, metric),
                     });
@@ -1205,6 +1293,7 @@ impl Disktree {
                     rect: self.animated_rect(tile.rect),
                     header: None,
                     depth: tile.depth,
+                    dim: self.matches.is_some(),
                     marked: false,
                     size_text: String::new(),
                 }),
@@ -1255,12 +1344,22 @@ impl Disktree {
         // relationship to the label inside it.
         self.layout_options.header = HEADER_REMS * self.rem;
         self.layout_options.header_inner = HEADER_INNER_REMS * self.rem;
+        // A filter is about the directory it was typed in: above it, it
+        // would hide everything beside that directory, so it lapses.
+        if self
+            .matches
+            .as_ref()
+            .is_some_and(|matches| !self.crumbs.starts_with(&matches.base))
+        {
+            self.clear_filter();
+        }
         let area = self.treemap_size.get();
         let key = LayoutKey {
             crumbs: self.crumbs.clone(),
             width: area.width.as_f32().round(),
             height: area.height.as_f32().round(),
             options: self.layout_options.clone(),
+            filter: self.filter_epoch,
         };
         if key.width < 1.0 || key.height < 1.0 {
             return None;
@@ -1270,12 +1369,15 @@ impl Disktree {
             let tree = self.tree.clone()?;
             let node = tree.resolve(&self.crumbs)?;
             let rect = Rect::new(0.0, 0.0, key.width, key.height);
-            let tiles = layout(
+            let filter =
+                self.matches.as_deref().filter(|_| self.filter_applied);
+            let tiles = layout_filtered(
                 node,
                 &key.crumbs,
                 rect,
                 self.options.metric,
                 &key.options,
+                filter,
             );
             self.cache = Some(LayoutCache { key, tiles });
         }
@@ -1372,7 +1474,7 @@ impl Disktree {
         if let Some(tree) = &self.tree {
             let mut tree = (**tree).clone();
             disktree_core::tree::aggregate(&mut tree, self.options.metric);
-            self.tree = Some(Rc::new(tree));
+            self.tree = Some(Arc::new(tree));
             let metric = self.options.metric;
             self.marks.refresh(
                 &self.root_path,
@@ -1382,6 +1484,7 @@ impl Disktree {
         }
         // Children are ordered by the metric, so every crumb moved.
         self.refresh_insights();
+        self.clear_filter();
         self.cache = None;
         cx.notify();
     }
@@ -1579,22 +1682,98 @@ impl Disktree {
     }
 
     /// Descend to a path found by the search field.
-    pub fn jump_to_match(&mut self, cx: &mut Context<'_, Self>) {
-        let needle = self.find.trim().to_lowercase();
-        if needle.is_empty() {
+    /// Recompute what the find text matches in the directory on screen.
+    ///
+    /// Off the UI thread: a whole disk is millions of names, a few hundred
+    /// milliseconds to search, and typing must not wait for it. Each
+    /// keystroke supersedes the search before it.
+    pub fn refresh_matches(&mut self, cx: &Context<'_, Self>) {
+        self.find_epoch += 1;
+        let epoch = self.find_epoch;
+        let needle = self.find.clone();
+        let Some(tree) =
+            self.tree.clone().filter(|_| !needle.trim().is_empty())
+        else {
+            self.matches = None;
+            self.filter_applied = false;
+            self.finding = false;
+            self.filter_epoch += 1;
+            return;
+        };
+        self.finding = true;
+        let base = self.crumbs.clone();
+        let task = cx.background_executor().spawn(async move {
+            tree.resolve(&base)
+                .and_then(|node| filter(node, &base, &needle))
+        });
+        cx.spawn(async move |this, cx| {
+            let found = task.await;
+            let _ = this.update(cx, |this, cx| {
+                if epoch != this.find_epoch {
+                    return;
+                }
+                this.finding = false;
+                this.matches = found.map(Arc::new);
+                this.filter_epoch += 1;
+                if std::mem::take(&mut this.apply_pending) {
+                    this.apply_filter(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Enter in the find field: lay out only the matches, with the largest
+    /// selected so Space marks it.
+    pub fn apply_filter(&mut self, cx: &mut Context<'_, Self>) {
+        self.find_open = false;
+        if self.finding {
+            self.apply_pending = true;
             return;
         }
-        let Some(tree) = self.tree.clone() else {
+        let Some(matches) = self.matches.clone() else {
             return;
         };
-        let Some((crumbs, _)) = tree.find(&needle) else {
-            self.notice =
-                Some((format!("no entry matches {needle}"), Status::Warning));
+        if matches.count == 0 {
+            self.notice = Some((
+                format!("nothing here matches {}", matches.needle),
+                Status::Warning,
+            ));
             cx.notify();
             return;
-        };
-        self.reveal(crumbs, cx);
+        }
+        self.filter_applied = true;
+        self.filter_epoch += 1;
+        self.view = View::IDENTITY;
+        self.transition = None;
+        self.forget_hover();
+        self.pointer_active = false;
+        let tree = self.tree.clone();
+        self.selected = matches
+            .keep
+            .iter()
+            .filter(|(_, keep)| **keep == Keep::Whole)
+            .filter_map(|(crumbs, _)| {
+                let node = tree.as_deref()?.resolve(crumbs)?;
+                Some((node.bytes, crumbs))
+            })
+            .max_by_key(|(bytes, _)| *bytes)
+            .map(|(_, crumbs)| crumbs.clone());
         self.notice = None;
+        cx.notify();
+    }
+
+    /// Drop the find text and the filter with it.
+    pub fn clear_filter(&mut self) {
+        self.find_epoch += 1;
+        self.finding = false;
+        self.apply_pending = false;
+        self.find.clear();
+        self.find_open = false;
+        self.matches = None;
+        self.filter_applied = false;
+        self.filter_epoch += 1;
     }
 
     // ── input ───────────────────────────────────────────────────────────
@@ -1641,16 +1820,11 @@ impl Disktree {
         // tree, and Escape always means "give the keyboard back".
         if self.screen == Screen::Explore && self.find_open {
             match key {
-                "escape" => {
-                    self.find_open = false;
-                    self.find.clear();
-                }
-                "enter" => {
-                    self.find_open = false;
-                    self.jump_to_match(cx);
-                }
+                "escape" => self.clear_filter(),
+                "enter" => self.apply_filter(cx),
                 "backspace" => {
                     self.find.pop();
+                    self.refresh_matches(cx);
                 }
                 _ => {
                     // Some platforms report only `key` for a character and
@@ -1663,6 +1837,7 @@ impl Disktree {
                         .unwrap_or(event.keystroke.key.as_str());
                     if !control && typed.chars().count() == 1 {
                         self.find.push_str(typed);
+                        self.refresh_matches(cx);
                     }
                 }
             }
@@ -1737,6 +1912,8 @@ impl Disktree {
                 self.move_selection(Direction::Down, cx);
             }
             "backspace" | "u" if !control => self.ascend(cx),
+            // A filter is the first thing Escape takes away.
+            "escape" if self.matches.is_some() => self.clear_filter(),
             "escape" => {
                 if self.selected.is_some() {
                     self.selected = None;
@@ -1785,14 +1962,7 @@ impl Disktree {
                 self.set_mode((self.mode_index() + 1) % 3, cx);
             }
             "r" if !control => self.start_scan(cx),
-            "g" if !control => {
-                let next = if self.scope() == Some(Scope::Disk) {
-                    Scope::Home
-                } else {
-                    Scope::Disk
-                };
-                self.set_scope(next, cx);
-            }
+            "g" if !control => self.go_to_disk(cx),
             "i" if !control => {
                 self.options.include_hidden = !self.options.include_hidden;
                 self.start_scan(cx);
@@ -2057,6 +2227,8 @@ pub struct Label {
     pub header: Option<Rect>,
     /// Nesting depth in this view: the first level is set in bold.
     pub depth: u32,
+    /// Filtered out while typing: drawn quietly.
+    pub dim: bool,
     pub marked: bool,
     pub size_text: String,
 }
@@ -2070,6 +2242,14 @@ const HEADER_REMS: f32 = 1.375;
 /// Height of the slim label row a deeper open directory keeps, in rem.
 const HEADER_INNER_REMS: f32 = 1.0;
 
+/// A trail step's label: the directory's own name, or `/` for the root.
+fn crumb_label(path: &Path) -> String {
+    path.file_name().map_or_else(
+        || path.display().to_string(),
+        |name| name.to_string_lossy().into_owned(),
+    )
+}
+
 /// Now, in Unix seconds.
 pub fn now_seconds() -> i64 {
     std::time::SystemTime::now()
@@ -2082,6 +2262,17 @@ pub fn now_seconds() -> i64 {
 /// Smallest tile, in rem, that gets a label: below this a name cannot be read.
 const LABEL_MIN_W_REMS: f32 = 3.375;
 const LABEL_MIN_H_REMS: f32 = 0.9375;
+
+/// How a tile stands against the find text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Filtered {
+    /// It matches, is inside a match, or nothing is being found.
+    Shown,
+    /// It holds matches: its fill steps back, its name stays readable.
+    Holds,
+    /// Nothing in it matches.
+    Out,
+}
 
 /// Where keyboard focus should go once a window is available.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

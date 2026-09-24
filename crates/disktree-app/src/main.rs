@@ -186,6 +186,8 @@ fn parse_args() -> Result<Args> {
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.
+    // Canonical, so a later widening recognises this tree in the wider walk.
+    let root = root.canonicalize().unwrap_or(root);
     let metadata = std::fs::metadata(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());

@@ -383,28 +383,74 @@ fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
-fn typing_in_the_find_field_jumps_to_a_match(cx: &mut TestAppContext) {
+fn typing_filters_live_and_enter_shows_only_the_matches(
+    cx: &mut TestAppContext,
+) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
     let (view, cx) = view_over(temp.path(), cx);
     draw(cx);
+    let names_drawn = |view: &Entity<Disktree>, cx: &mut Window| {
+        update(view, cx, |app, _| {
+            let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
+            tiles
+                .iter()
+                .filter_map(|tile| app.node_at(tile.crumbs()))
+                .map(|node| node.name.to_string())
+                .collect::<Vec<_>>()
+        })
+    };
 
     press(cx, "/");
-    assert!(read(&view, cx, |app| app.find_open));
-
-    cx.simulate_input("deeper");
+    cx.simulate_input("BLOB");
+    // The search runs off the UI thread; let it land.
+    cx.run_until_parked();
     draw(cx);
-    assert_eq!(read(&view, cx, |app| app.find.clone()), "deeper");
-
-    press(cx, "enter");
-    let (open, crumbs, selected) = read(&view, cx, |app| {
-        (app.find_open, app.crumbs.clone(), app.selected.clone())
+    // Live: two matches, nothing hidden yet, the rest only dimmed.
+    let (count, applied, keep_filtered) = read(&view, cx, |app| {
+        let matches = app.matches.as_deref().expect("matching as it is typed");
+        let keep = app.tree().and_then(|tree| {
+            tree.children
+                .iter()
+                .position(|child| &*child.name == "keep")
+        });
+        (
+            matches.count,
+            app.filter_applied,
+            keep.is_some_and(|index| matches.keep(&[index]).is_none()),
+        )
     });
-    assert!(!open);
-    assert_eq!(crumbs, vec![1], "the matched entry's parent is drawn");
-    // junk holds blob.bin (largest first) and then deeper, so the match sits at
-    // the second index: the find jumps to the entry, not to its rank.
-    assert_eq!(selected, Some(vec![1, 1]));
+    assert_eq!(count, 2, "junk/blob.bin and .cache/blob.bin");
+    assert!(!applied);
+    assert!(keep_filtered, "keep holds no blob");
+    // Dimmed, not hidden: a non-match is still drawn while typing.
+    assert!(names_drawn(&view, cx).contains(&"deeper".to_string()));
+
+    // Enter: only the matches, and the largest selected for marking.
+    press(cx, "enter");
+    let drawn = names_drawn(&view, cx);
+    assert!(read(&view, cx, |app| app.filter_applied));
+    assert!(
+        !drawn.iter().any(|name| name == "keep" || name == "deeper"),
+        "{drawn:?}"
+    );
+    assert_eq!(
+        drawn.iter().filter(|name| *name == "blob.bin").count(),
+        2,
+        "{drawn:?}"
+    );
+    let selected = read(&view, cx, |app| {
+        app.selected
+            .as_deref()
+            .and_then(|crumbs| app.path_at(crumbs))
+    });
+    assert_eq!(selected, Some(temp.path().join(".cache/blob.bin")));
+
+    // Escape gives everything back.
+    press(cx, "escape");
+    assert!(read(&view, cx, |app| app.matches.is_none()
+        && !app.filter_applied));
+    assert!(names_drawn(&view, cx).contains(&"deeper".to_string()));
 }
 
 #[gpui_kit::test]
@@ -883,31 +929,79 @@ fn dragging_the_panel_edge_resizes_it_within_its_limits(
 }
 
 #[gpui_kit::test]
-fn g_switches_between_the_home_directory_and_the_whole_disk(
+fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     cx: &mut TestAppContext,
 ) {
-    use crate::state::Scope;
+    use crate::state::Crumb;
 
     cx.update(gpui_omarchy::init);
     let temp = fixture();
-    let (view, cx) = view_over(temp.path(), cx);
-    // Stand-ins: the fixture is "home", a directory in it is "the disk".
-    let disk = temp.path().join("junk");
+    let inner = temp.path().join("junk");
+    let (view, cx) = view_over(&inner, cx);
     update(&view, cx, |app, _| {
-        app.home = Some(temp.path().to_path_buf());
-        app.disk_root = Some(disk.clone());
+        app.disk_root = Some(temp.path().to_path_buf());
     });
-    assert_eq!(read(&view, cx, Disktree::scope), Some(Scope::Home));
+    let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
+
+    // The trail runs from "/", and the scanned root sits under its parents.
+    let trail = read(&view, cx, Disktree::breadcrumbs);
+    assert_eq!(trail[0].0, "/");
+    assert!(
+        trail.contains(&(
+            temp.path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            Crumb::Above(temp.path().to_path_buf())
+        ))
+    );
+
+    // Written after the first scan: a memoized subtree cannot see it.
+    std::fs::write(inner.join("late.bin"), vec![0_u8; 4096]).expect("write");
 
     press(cx, "g");
-    assert_eq!(read(&view, cx, |app| app.root_path.clone()), disk);
-    assert!(read(&view, cx, |app| app.scan.is_some()), "a new scan runs");
+    // The old tree stays on screen while the wider one is read.
+    assert!(read(&view, cx, |app| app.tree().is_some()));
     finish_scan(&view, cx);
-    assert_eq!(read(&view, cx, Disktree::scope), Some(Scope::Disk));
-    let top = read(&view, cx, |app| app.tree().map(|tree| tree.bytes));
-    assert!(top.is_some_and(|bytes| bytes > 0));
+    assert_eq!(read(&view, cx, |app| app.root_path.clone()), temp.path());
+    let (reused, rest, selected) = read(&view, cx, |app| {
+        let tree = app.tree().expect("the wider tree");
+        let junk = tree.child_named("junk").map(|node| node.files);
+        let selected = app
+            .selected
+            .as_deref()
+            .and_then(|crumbs| app.node_at(crumbs))
+            .map(|node| node.name.to_string());
+        (junk, tree.child_named("keep").is_some(), selected)
+    });
+    assert_eq!(reused, before, "junk was reused, not walked again");
+    assert!(rest, "what is outside it was walked");
+    assert_eq!(selected.as_deref(), Some("junk"), "where you came from");
+}
 
-    press(cx, "g");
-    finish_scan(&view, cx);
-    assert_eq!(read(&view, cx, Disktree::scope), Some(Scope::Home));
+#[gpui_kit::test]
+fn enter_before_the_search_lands_applies_it_when_it_does(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    press(cx, "/");
+    cx.simulate_input("blob");
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    draw(cx);
+    let (applied, count, open) = read(&view, cx, |app| {
+        (
+            app.filter_applied,
+            app.matches.as_deref().map(|matches| matches.count),
+            app.find_open,
+        )
+    });
+    assert!(applied, "Enter was not lost to a search in flight");
+    assert_eq!(count, Some(2));
+    assert!(!open);
 }

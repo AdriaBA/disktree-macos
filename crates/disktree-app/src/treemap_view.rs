@@ -24,7 +24,7 @@ use gpui_omarchy::{ActiveTheme, Theme};
 use disktree_core::classify::Category;
 
 use crate::palette;
-use crate::state::{Disktree, Label, View};
+use crate::state::{Disktree, Filtered, Label, View};
 
 /// How one tile should be drawn, resolved before the paint callback runs so
 /// that painting never has to look anything up.
@@ -40,6 +40,8 @@ pub struct TileDeco {
     pub age_bucket: Option<usize>,
     /// Its space can be had back: hatched.
     pub reclaimable: bool,
+    /// How it stands against the find text.
+    pub filtered: Filtered,
     /// Part of it could not be read: flagged in its corner.
     pub unreadable: bool,
     pub marked: bool,
@@ -159,6 +161,8 @@ struct Colors {
     /// Fills per age bucket, then per depth.
     age: Vec<[Hsla; DEPTHS]>,
     marked_fill: Hsla,
+    /// The surface a filtered-out fill steps back toward.
+    inset: Hsla,
 }
 
 /// Depth steps a fill distinguishes; deeper clamps.
@@ -220,6 +224,7 @@ impl Colors {
                 })
                 .collect(),
             marked_fill: palette::mix(theme.inset, theme.danger, 0.16),
+            inset: theme.inset,
         }
     }
 
@@ -228,9 +233,16 @@ impl Colors {
             return self.marked_fill;
         }
         let depth = (tile.depth as usize).min(DEPTHS - 1);
-        match tile.age_bucket {
+        let fill = match tile.age_bucket {
             Some(bucket) => self.age[bucket.min(self.age.len() - 1)][depth],
             None => self.fill[category_index(tile.category)][depth],
+        };
+        // Only what matches keeps its colour; a directory holding matches
+        // steps back less, so the way to them stays readable.
+        match tile.filtered {
+            Filtered::Shown => fill,
+            Filtered::Holds => palette::mix(fill, self.inset, 0.55),
+            Filtered::Out => palette::mix(fill, self.inset, 0.82),
         }
     }
 
@@ -275,7 +287,8 @@ fn paint_tiles(
         // "can it go", the colour "what is it". Everything inside a
         // reclaimable directory is reclaimable too, so only the outermost
         // one needs painting; its children repaint their own fill and hatch.
-        if tile.reclaimable && !tile.marked {
+        if tile.reclaimable && !tile.marked && tile.filtered == Filtered::Shown
+        {
             window.paint_quad(quad(
                 quad_bounds,
                 Corners::default(),
@@ -288,7 +301,10 @@ fn paint_tiles(
 
         // A top-level directory carries a thin strip of its colour, so the
         // first level of structure reads before any detail.
-        if tile.depth == 0 && tile.age_bucket.is_none() {
+        if tile.depth == 0
+            && tile.age_bucket.is_none()
+            && tile.filtered != Filtered::Out
+        {
             let strip = Bounds::new(
                 quad_bounds.origin,
                 Size::new(
@@ -415,6 +431,8 @@ fn paint_labels(
         );
         let color = if label.marked {
             colors.marked_label
+        } else if label.dim {
+            colors.label_dim
         } else {
             colors.label(label.depth)
         };

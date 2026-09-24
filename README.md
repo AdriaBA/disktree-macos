@@ -51,8 +51,9 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
 
 - **Top:** the scan totals, then what is measured — **Size**, **Files** or
   **Age**, **Hidden files**, **Apparent size**, and the depth drawn.
-- **Trail:** the path as a clickable trail, and the
-  legend.
+- **Trail:** the path from `/`, and the legend. Everything below the scanned
+  root is a place to go; everything above it is dimmer, and clicking it
+  widens the scan to there (see below).
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
   toolchains, synced files, git, media, documents, caches — at one muted
   level, lighter with depth. A diagonal hatch is space that can be had back
@@ -120,13 +121,13 @@ and shows how much free space was actually gained.
 | `[` `]` | draw fewer or more levels at once |
 | `-` `=` `0` | magnify, shrink, reset the view |
 | `ctrl =` `ctrl -` `ctrl 0` | interface zoom |
-| `/` | find an entry by name |
+| `/` | filter by name: only matches keep their colour; `enter` shows only them, `esc` clears |
 | `c` | review the marked list |
 | `t` | rank by size or by file count |
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
-| `g` | home directory or the whole disk |
+| `g` | the whole disk |
 | `p` | show or hide the selection line |
 | `?` | every key |
 | `q` | quit |
@@ -150,9 +151,16 @@ and removes duplicate hardlinks.
 
 ## The whole disk
 
-**~ Home | / Whole disk** in the top bar, `g`, `disktree --disk`, or
-the launcher's *Scan the whole disk* action scans the disk your home
-directory lives on — `/` on Omarchy.
+Click `/` (or any directory above the scanned root) in the trail, press
+`g`, run `disktree --disk`, or use the launcher's *Scan the whole disk*
+action. `g` and `--disk` scan the disk your home directory lives on — `/`
+on Omarchy.
+
+Widening is memoized: the tree already measured is handed to the wider walk
+and reused where it is reached, so going from `~` to `/` reads only what is
+outside `~` (on this machine, seconds instead of a full rescan). The current
+view stays on screen until the wider tree lands, which then opens with the
+directory you came from selected. Going back down is just navigation.
 
 A scan stays on one volume, and a volume is the mount *source*, not the
 device number: btrfs gives each subvolume its own `st_dev`, so `/home`,
