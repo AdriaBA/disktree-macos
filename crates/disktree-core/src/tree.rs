@@ -144,6 +144,11 @@ impl Node {
         }
     }
 
+    /// The child with this name, if there is one.
+    pub fn child_named(&self, name: &str) -> Option<&Self> {
+        self.children.iter().find(|child| &*child.name == name)
+    }
+
     pub fn child(&self, index: usize) -> Option<&Self> {
         self.children.get(index)
     }

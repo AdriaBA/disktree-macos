@@ -6,6 +6,7 @@
 //! be built and tested without GPUI, a display, or a GPU.
 
 pub mod classify;
+pub mod filter;
 pub mod insights;
 pub mod removal;
 pub mod scan;

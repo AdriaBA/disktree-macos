@@ -156,11 +156,31 @@ pub struct ScanHandle {
     result: Receiver<io::Result<Node>>,
 }
 
+/// A subtree already measured, reused by a wider scan instead of walked
+/// again: widening from `~` to `/` only reads what is outside `~`.
+#[derive(Clone, Debug)]
+pub struct Known {
+    /// Where it is. Compared with the walk's own paths, so give it in the
+    /// same form as the root (both canonical).
+    pub path: PathBuf,
+    pub tree: Arc<Node>,
+}
+
 impl ScanHandle {
     /// Start walking `root` on a worker thread.
     pub fn spawn(root: PathBuf, options: ScanOptions) -> Self {
+        Self::spawn_with(root, options, None)
+    }
+
+    /// Start walking `root`, reusing `known` where the walk reaches it.
+    pub fn spawn_with(
+        root: PathBuf,
+        options: ScanOptions,
+        known: Option<Known>,
+    ) -> Self {
         let progress = Arc::new(ScanProgress::default());
         let context = Arc::new(WalkContext {
+            known,
             options,
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
@@ -208,6 +228,7 @@ impl ScanHandle {
 pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
     let progress = Arc::new(ScanProgress::default());
     let context = Arc::new(WalkContext {
+        known: None,
         options,
         progress: Arc::clone(&progress),
         root_device: Mutex::new(None),
@@ -221,6 +242,8 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
 }
 
 struct WalkContext {
+    /// A subtree to reuse rather than walk.
+    known: Option<Known>,
     options: ScanOptions,
     progress: Arc<ScanProgress>,
     /// Device of the root, resolved once: the `one_filesystem` fallback
@@ -274,6 +297,20 @@ impl WalkContext {
         }
 
         if file_type.is_dir() {
+            // Memoized: the subtree a narrower scan already measured is
+            // taken whole, before any volume rule, since it was measured
+            // under the same rules.
+            if let Some(known) = &self.known
+                && known.path == path
+            {
+                let tree = (*known.tree).clone();
+                self.progress.files.fetch_add(tree.files, Ordering::Relaxed);
+                self.progress.bytes.fetch_add(tree.bytes, Ordering::Relaxed);
+                self.progress.dirs.fetch_add(tree.dirs, Ordering::Relaxed);
+                let mut tree = tree;
+                tree.name = name;
+                return Classified::Entry(tree);
+            }
             if self.options.one_filesystem
                 && let Some(foreign) = self.foreign_mounts.get()
             {
@@ -906,6 +943,7 @@ mod tests {
         let readable = fs::read_dir(&locked).map(|mut it| it.next().is_some());
         let progress = Arc::new(ScanProgress::default());
         let context = Arc::new(WalkContext {
+            known: None,
             options: options(),
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
@@ -958,6 +996,44 @@ mod tests {
         assert_eq!(snapshot.errors, 0);
     }
 
+    #[test]
+    fn a_wider_scan_reuses_the_subtree_it_already_knows() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().canonicalize().expect("canonical");
+        let inner = root.join("inner");
+        fs::create_dir_all(inner.join("deep")).expect("mkdir");
+        fs::write(inner.join("deep/a.bin"), vec![0_u8; 4096]).expect("write");
+        fs::write(root.join("outside.bin"), vec![0_u8; 8192]).expect("write");
+        let known = scan(&inner, options()).expect("inner scan");
+
+        // Changed on disk after the inner scan: a memoized subtree must not
+        // see it, which is how this test knows the walk skipped it.
+        fs::write(inner.join("deep/b.bin"), vec![0_u8; 4096]).expect("write");
+
+        let handle = ScanHandle::spawn_with(
+            root,
+            options(),
+            Some(Known {
+                path: inner,
+                tree: Arc::new(known.clone()),
+            }),
+        );
+        let tree = loop {
+            if let Some(outcome) = handle.poll() {
+                break outcome.expect("wide scan");
+            }
+            thread::sleep(std::time::Duration::from_millis(2));
+        };
+        let reused = tree.child_named("inner").expect("inner is in the tree");
+        assert_eq!(reused.files, known.files, "b.bin was never read");
+        assert_eq!(reused.bytes, known.bytes);
+        assert!(
+            tree.child_named("outside.bin").is_some(),
+            "the rest was walked"
+        );
+        assert_eq!(tree.files, known.files + 1);
+    }
+
     /// A real whole-disk scan, run by hand: `cargo test -p disktree-core
     /// -- --ignored --nocapture whole_disk`. Prints what it found, so the
     /// volume rules can be checked against this machine's mounts.
@@ -984,5 +1060,16 @@ mod tests {
         let skipped =
             crate::space::foreign_mounts_for(&root).unwrap_or_default();
         println!("left out: {skipped:?}");
+        for needle in ["c", "cache", "node_modules", "zzzz"] {
+            let started = std::time::Instant::now();
+            let found =
+                crate::filter::filter(&tree, &[], needle).expect("needle");
+            println!(
+                "filter {needle:?}: {} matches, {} in {:.1?}",
+                found.count,
+                crate::size::human_bytes(found.bytes),
+                started.elapsed()
+            );
+        }
     }
 }

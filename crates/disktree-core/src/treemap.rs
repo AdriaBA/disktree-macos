@@ -10,6 +10,7 @@
 //! view applies its own pan and zoom when painting, so re-layout is only needed
 //! when the tree, the viewport size, or the requested depth changes.
 
+use crate::filter::{Keep, Matches};
 use crate::tree::{Metric, Node};
 
 /// An axis-aligned rectangle in viewport pixels.
@@ -150,21 +151,48 @@ pub fn layout(
     metric: Metric,
     options: &LayoutOptions,
 ) -> Vec<Tile> {
+    layout_filtered(root, root_crumbs, area, metric, options, None)
+}
+
+/// [`layout`], showing only what `filter` keeps: its matches, at the size
+/// of what matched, inside ancestors sized the same way.
+pub fn layout_filtered(
+    root: &Node,
+    root_crumbs: &[usize],
+    area: Rect,
+    metric: Metric,
+    options: &LayoutOptions,
+    filter: Option<&Matches>,
+) -> Vec<Tile> {
     let mut tiles = Vec::new();
     let mut crumbs = root_crumbs.to_vec();
-    place_children(root, area, metric, options, 0, &mut crumbs, &mut tiles);
+    let place = Placement {
+        metric,
+        options,
+        filter,
+    };
+    place_children(root, area, &place, 0, &mut crumbs, &mut tiles);
     tiles
+}
+
+/// What stays the same for every level of one layout.
+struct Placement<'a> {
+    metric: Metric,
+    options: &'a LayoutOptions,
+    /// Set while the level being placed is inside a filtered region; a
+    /// match clears it for everything beneath.
+    filter: Option<&'a Matches>,
 }
 
 fn place_children(
     node: &Node,
     area: Rect,
-    metric: Metric,
-    options: &LayoutOptions,
+    place: &Placement<'_>,
     depth: u32,
     crumbs: &mut Vec<usize>,
     out: &mut Vec<Tile>,
 ) {
+    let (metric, options) = (place.metric, place.options);
     if node.children.is_empty() || area.w <= 0.0 || area.h <= 0.0 {
         return;
     }
@@ -175,7 +203,18 @@ fn place_children(
         .children
         .iter()
         .enumerate()
-        .map(|(index, child)| (index, child.value(metric) as f64))
+        .filter_map(|(index, child)| {
+            let value = match place.filter {
+                None => child.value(metric),
+                Some(filter) => {
+                    crumbs.push(index);
+                    let keep = filter.keep(crumbs);
+                    crumbs.pop();
+                    Matches::value(keep?, child, metric)
+                }
+            };
+            Some((index, value as f64))
+        })
         .filter(|(_, value)| *value > 0.0)
         .collect();
     if ranked.is_empty() {
@@ -243,15 +282,14 @@ fn place_children(
                 rect.w,
                 rect.bottom() - header.bottom(),
             );
-            place_children(
-                child,
-                body,
-                metric,
-                options,
-                depth + 1,
-                crumbs,
-                out,
-            );
+            // Beneath a match everything is shown; above one, only matches.
+            let inner = Placement {
+                filter: place
+                    .filter
+                    .filter(|filter| filter.keep(crumbs) != Some(Keep::Whole)),
+                ..*place
+            };
+            place_children(child, body, &inner, depth + 1, crumbs, out);
         }
         crumbs.pop();
     }
@@ -626,5 +664,62 @@ mod tests {
         let found = hit(&tiles, centre.0, centre.1).expect("a hit");
         assert_eq!(found.crumbs(), &[0, 0]);
         assert!(hit(&tiles, -50.0, -50.0).is_none());
+    }
+
+    #[test]
+    fn a_filtered_layout_shows_only_the_matches_at_their_size() {
+        use crate::filter::filter;
+        use crate::tree::{NodeKind, aggregate};
+
+        let file = |name: &str, bytes| Node::entry(name, NodeKind::File, bytes);
+        let mut src = Node::directory("src");
+        src.children = vec![file("big_test.rs", 300), file("other.rs", 700)];
+        let mut root = Node::directory("root");
+        root.children =
+            vec![src, file("unit_test.txt", 100), file("huge.iso", 5000)];
+        aggregate(&mut root, Metric::Bytes);
+
+        let matches = filter(&root, &[], "test").expect("needle");
+        let area = Rect::new(0.0, 0.0, 400.0, 400.0);
+        let options = LayoutOptions {
+            padding: 0.0,
+            padding_outer: 0.0,
+            ..LayoutOptions::default()
+        };
+        let tiles = layout_filtered(
+            &root,
+            &[],
+            area,
+            Metric::Bytes,
+            &options,
+            Some(&matches),
+        );
+        let names: Vec<String> = tiles
+            .iter()
+            .filter_map(|tile| root.resolve(tile.crumbs()))
+            .map(|node| node.name.to_string())
+            .collect();
+        assert!(names.contains(&"big_test.rs".to_string()));
+        assert!(names.contains(&"unit_test.txt".to_string()));
+        assert!(
+            !names
+                .iter()
+                .any(|name| name == "huge.iso" || name == "other.rs")
+        );
+
+        // src is sized by its 300 matched bytes, not its 1000: three times
+        // the 100-byte match beside it.
+        let area_of = |name: &str| {
+            tiles
+                .iter()
+                .find(|tile| {
+                    root.resolve(tile.crumbs())
+                        .is_some_and(|node| &*node.name == name)
+                })
+                .map(|tile| tile.rect.w * tile.rect.h)
+                .expect("drawn")
+        };
+        let ratio = area_of("src") / area_of("unit_test.txt");
+        assert!((ratio - 3.0).abs() < 0.05, "ratio {ratio}");
     }
 }
