@@ -47,6 +47,31 @@ pub enum ColorMode {
     Age,
 }
 
+/// A trail crumb's sibling menu, open.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CrumbMenu {
+    /// Crumbs of the directory whose children are listed.
+    pub parent: Vec<usize>,
+    /// The listed child the crumb stands for.
+    pub current: usize,
+    /// The row the arrow keys are on, as an index into [`Disktree::siblings`].
+    pub highlighted: usize,
+}
+
+/// One row of a sibling menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Sibling {
+    /// Index among the parent's children.
+    pub index: usize,
+    pub name: String,
+    pub value: u64,
+    pub category: disktree_core::classify::Category,
+    pub is_dir: bool,
+}
+
+/// Rows a sibling menu lists; the rest are counted.
+pub const SIBLING_ROWS: usize = 24;
+
 /// One step of the trail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Crumb {
@@ -356,6 +381,8 @@ pub struct Disktree {
     pub show_help: bool,
     pub show_selection: bool,
     pub focus: FocusHandle,
+    /// A trail crumb's sibling menu, when open.
+    pub crumb_menu: Option<CrumbMenu>,
 
     pub color_mode: ColorMode,
     /// The largest things worth clearing, recomputed when a scan lands.
@@ -445,6 +472,7 @@ impl Disktree {
             show_help: false,
             show_selection: true,
             focus: cx.focus_handle(),
+            crumb_menu: None,
             color_mode: ColorMode::Kind,
             insights: Vec::new(),
             git: FxHashMap::default(),
@@ -805,6 +833,110 @@ impl Disktree {
         trail
     }
 
+    /// The children of `parent`, largest first, for a sibling menu, and how
+    /// many more there are beyond [`SIBLING_ROWS`].
+    pub fn siblings(&self, parent: &[usize]) -> (Vec<Sibling>, usize) {
+        let metric = self.options.metric;
+        let Some(node) = self.node_at(parent) else {
+            return (Vec::new(), 0);
+        };
+        let mut rows: Vec<Sibling> = node
+            .children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| Sibling {
+                index,
+                name: child.name.to_string(),
+                value: child.value(metric),
+                category: child.category,
+                is_dir: child.is_dir(),
+            })
+            .collect();
+        rows.sort_by_key(|row| std::cmp::Reverse(row.value));
+        let more = rows.len().saturating_sub(SIBLING_ROWS);
+        rows.truncate(SIBLING_ROWS);
+        (rows, more)
+    }
+
+    /// Open the sibling menu for the crumb at `crumbs` (not the root).
+    pub fn open_crumb_menu(
+        &mut self,
+        crumbs: &[usize],
+        cx: &mut Context<'_, Self>,
+    ) {
+        let Some((&current, parent)) = crumbs.split_last() else {
+            return;
+        };
+        let (rows, _) = self.siblings(parent);
+        let highlighted = rows
+            .iter()
+            .position(|row| row.index == current)
+            .unwrap_or(0);
+        self.crumb_menu = Some(CrumbMenu {
+            parent: parent.to_vec(),
+            current,
+            highlighted,
+        });
+        cx.notify();
+    }
+
+    /// Go to a sibling: into it when it is a directory, beside it (selected)
+    /// when it is a file.
+    pub fn choose_sibling(
+        &mut self,
+        parent: &[usize],
+        index: usize,
+        cx: &mut Context<'_, Self>,
+    ) {
+        self.crumb_menu = None;
+        let mut crumbs = parent.to_vec();
+        crumbs.push(index);
+        if self.node_at(&crumbs).is_some_and(Node::is_dir) {
+            self.go_to(crumbs, cx);
+        } else {
+            self.reveal(crumbs, cx);
+        }
+    }
+
+    /// Keys while a sibling menu is open: it owns the arrows, Enter and
+    /// Escape, and any other key closes it before acting.
+    fn on_menu_key(&mut self, key: &str, cx: &mut Context<'_, Self>) -> bool {
+        let Some(menu) = self.crumb_menu.clone() else {
+            return false;
+        };
+        let (rows, _) = self.siblings(&menu.parent);
+        let last = rows.len().saturating_sub(1);
+        match key {
+            "down" | "j" => {
+                self.set_highlight((menu.highlighted + 1).min(last));
+            }
+            "up" | "k" => {
+                self.set_highlight(menu.highlighted.saturating_sub(1));
+            }
+            "home" => self.set_highlight(0),
+            "end" => self.set_highlight(last),
+            "enter" | "space" | "right" | "l" => {
+                if let Some(row) = rows.get(menu.highlighted) {
+                    self.choose_sibling(&menu.parent, row.index, cx);
+                }
+            }
+            "escape" | "left" | "h" => self.crumb_menu = None,
+            _ => {
+                self.crumb_menu = None;
+                cx.notify();
+                return false;
+            }
+        }
+        cx.notify();
+        true
+    }
+
+    const fn set_highlight(&mut self, row: usize) {
+        if let Some(menu) = &mut self.crumb_menu {
+            menu.highlighted = row;
+        }
+    }
+
     /// Descend into the selected tile, or into the largest child of the
     /// current root when nothing is selected.
     pub fn descend(&mut self, cx: &mut Context<'_, Self>) {
@@ -942,6 +1074,7 @@ impl Disktree {
     /// A jump can skip several levels, so there is no single region to move:
     /// it lands immediately, the way selecting a folder does.
     pub fn go_to(&mut self, crumbs: Vec<usize>, cx: &mut Context<'_, Self>) {
+        self.crumb_menu = None;
         self.crumbs.clone_from(&crumbs);
         self.selected = Some(crumbs);
         self.forget_hover();
@@ -1804,6 +1937,10 @@ impl Disktree {
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
         if self.confirm_open {
+            return;
+        }
+
+        if self.crumb_menu.is_some() && self.on_menu_key(key, cx) {
             return;
         }
 

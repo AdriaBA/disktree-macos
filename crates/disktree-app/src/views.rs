@@ -14,8 +14,8 @@ use gpui_kit::{
     App, AppContext as _, ClickEvent, Context, Div, DragMoveEvent, ElementId,
     FontWeight, InteractiveElement as _, IntoElement, KeyDownEvent,
     ParentElement, Rems, SharedString, Stateful,
-    StatefulInteractiveElement as _, Styled, Window, div, pattern_slash, px,
-    relative,
+    StatefulInteractiveElement as _, Styled, Window, anchored, deferred, div,
+    pattern_slash, px, relative,
 };
 use gpui_omarchy::{
     ActiveTheme, ButtonVariant, ChoiceItem, Theme, alert_dialog, button,
@@ -32,10 +32,6 @@ use crate::state::{
 use crate::treemap_view::{self, Mosaic};
 use crate::ui::{icon, size, space, text};
 use crate::widgets;
-
-/// Width, in rem, at which the header holds title, settings and totals on one
-/// line. Narrower, the totals move into the status bar.
-const HEADER_WIDE_REMS: f32 = 74.0;
 
 /// How many marks the review screen lists. Everything above the cap is still
 /// removed; the list only stops being exhaustive, which it says out loud.
@@ -182,7 +178,6 @@ fn explore(
     let theme = cx.omarchy().clone();
     let mosaic: Mosaic = app.prepare();
     let width_rems = window.viewport_size().width.as_f32() / app.rem;
-    let wide = width_rems >= HEADER_WIDE_REMS;
     // The panel is where the selection, the marks and the disk live; it
     // only gives way when the mosaic would be too narrow to read.
     let panel = app.show_selection && width_rems >= PANEL_SHOWN_REMS;
@@ -203,7 +198,7 @@ fn explore(
         .flex_col()
         .flex_1()
         .min_h_0()
-        .child(top_bar(app, &theme, wide, window, cx))
+        .child(top_bar(app, &theme, window, cx))
         .child(
             div()
                 .id("explore-body")
@@ -284,17 +279,10 @@ impl gpui_kit::Render for NoGhost {
 fn top_bar(
     app: &Disktree,
     theme: &Theme,
-    wide: bool,
     window: &mut Window,
     cx: &mut Context<'_, Disktree>,
 ) -> Div {
-    let tree = app.tree();
-    let scanned = tree.map_or(app.progress.bytes, |node| node.bytes);
-    let files = tree.map_or(app.progress.files, |node| node.files);
-    let dirs = tree.map_or(app.progress.dirs, |node| node.dirs);
-    let errors = app.progress.errors;
-
-    let mut row = div()
+    div()
         .flex()
         .flex_row()
         .items_center()
@@ -303,41 +291,283 @@ fn top_bar(
         .py(space::MD)
         .border_b_1()
         .border_color(theme.divider())
-        .child(logo(theme));
-    if wide {
-        let value = |text: String| text;
-        row = row
-            .child(widgets::figure(
-                "Scanned",
-                value(human_bytes(scanned)),
-                theme.bright,
-                cx,
-            ))
-            .child(widgets::figure(
-                "Files",
-                widgets::human_count(files),
-                theme.bright,
-                cx,
-            ))
-            .child(widgets::figure(
-                "Dirs",
-                widgets::human_count(dirs),
-                theme.bright,
-                cx,
-            ))
-            .child(widgets::figure(
-                "Unreadable",
-                widgets::human_count(errors),
-                if errors > 0 {
-                    theme.warning
-                } else {
-                    theme.secondary
-                },
-                cx,
-            ));
-    }
-    row.child(div().flex_1())
+        .child(logo(theme))
+        // Where you are is navigation, and it belongs to the whole window.
+        .child(trail(app, theme, cx))
+        .child(div().flex_1())
         .child(view_settings(app, window, cx))
+}
+
+/// The trail, from `/`. Above the scanned root, a crumb widens the scan;
+/// in the tree, it goes there, and its ▾ lists its siblings to jump to.
+/// A deep trail keeps its first two steps and its last four.
+fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
+    let steps = app.breadcrumbs();
+    let last = steps.len().saturating_sub(1);
+    let widening = app.scan.is_some() && app.scan_root != app.root_path;
+    let hidden = if steps.len() > TRAIL_STEPS {
+        2..steps.len() - (TRAIL_STEPS - 3)
+    } else {
+        0..0
+    };
+    let mut row = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::XXS)
+        .min_w_0()
+        .overflow_hidden();
+    for (index, (label, step)) in steps.into_iter().enumerate() {
+        if hidden.contains(&index) {
+            if index == hidden.start {
+                row = row.child(separator_glyph(theme)).child(
+                    div()
+                        .px(space::XS)
+                        .text_color(theme.secondary.opacity(0.6))
+                        .child("…"),
+                );
+            }
+            continue;
+        }
+        // The root is its own separator: "/" then "home", not "/ / home".
+        if index > 1 {
+            row = row.child(separator_glyph(theme));
+        }
+        let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
+        let crumb = match step {
+            Crumb::Above(path) => {
+                let pending = widening && app.scan_root == path;
+                with_tooltip(
+                    widgets::crumb(id, label, false, cx)
+                        .text_color(if pending {
+                            palette::highlight(theme)
+                        } else {
+                            theme.secondary.opacity(0.7)
+                        })
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.widen_to(path.clone(), cx);
+                        })),
+                    "Scan from here · what is below is reused",
+                )
+                .into_any_element()
+            }
+            Crumb::Tree(path) => {
+                tree_crumb(app, theme, id, label, path, index == last, cx)
+            }
+        };
+        row = row.child(crumb);
+    }
+    row
+}
+
+/// Steps a trail shows before it folds its middle into an ellipsis.
+const TRAIL_STEPS: usize = 7;
+
+fn separator_glyph(theme: &Theme) -> Div {
+    div()
+        .text_color(theme.secondary.opacity(0.5))
+        .text_size(text::BODY)
+        .child("/")
+}
+
+/// A crumb in the tree. Its label goes there (the current one opens the
+/// menu instead, being there already); its ▾ opens the sibling menu.
+fn tree_crumb(
+    app: &Disktree,
+    theme: &Theme,
+    id: ElementId,
+    label: String,
+    path: Vec<usize>,
+    current: bool,
+    cx: &Context<'_, Disktree>,
+) -> gpui_kit::AnyElement {
+    let Some((&index, parent)) = path.split_last() else {
+        // The scanned root: no siblings in the tree to offer.
+        return widgets::crumb(id, label, current, cx)
+            .on_click(
+                cx.listener(move |this, _, _, cx| this.go_to(Vec::new(), cx)),
+            )
+            .into_any_element();
+    };
+    let parent = parent.to_vec();
+    let open = app
+        .crumb_menu
+        .as_ref()
+        .is_some_and(|menu| menu.parent == parent && menu.current == index);
+    let chevron_path = path.clone();
+    let label_path = path;
+    let chip = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .when(current || open, |this| this.bg(theme.hover_fill()))
+        .child(widgets::crumb(id.clone(), label, current, cx).on_click(
+            cx.listener(move |this, _, _, cx| {
+                if current {
+                    this.open_crumb_menu(&label_path, cx);
+                } else {
+                    this.go_to(label_path.clone(), cx);
+                }
+            }),
+        ))
+        .child(
+            div()
+                .id(ElementId::Name(format!("{id}-menu").into()))
+                .debug_selector({
+                    let name = format!("{id}-menu");
+                    move || name
+                })
+                .px(space::XS)
+                .py(space::XXS)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary)
+                .hover(|style| {
+                    style.bg(theme.hover_fill()).text_color(theme.bright)
+                })
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if this.crumb_menu.is_some() {
+                        this.crumb_menu = None;
+                        cx.notify();
+                    } else {
+                        this.open_crumb_menu(&chevron_path, cx);
+                    }
+                }))
+                .child("▾"),
+        );
+    div()
+        .flex()
+        .flex_col()
+        .child(chip)
+        .when(open, |this| {
+            this.child(
+                deferred(
+                    anchored()
+                        .snap_to_window_with_margin(px(8.))
+                        .offset(gpui_kit::point(px(0.), px(4.)))
+                        .child(sibling_menu(app, theme, &parent, cx)),
+                )
+                .with_priority(2),
+            )
+        })
+        .into_any_element()
+}
+
+/// The siblings of a crumb, largest first, with a share bar in each one's
+/// colour and its size: a sideways jump without going up first.
+fn sibling_menu(
+    app: &Disktree,
+    theme: &Theme,
+    parent: &[usize],
+    cx: &Context<'_, Disktree>,
+) -> impl IntoElement {
+    let (rows, more) = app.siblings(parent);
+    let menu = app.crumb_menu.clone();
+    let largest = rows.first().map_or(1, |row| row.value.max(1));
+    let parent_name = app.node_at(parent).map_or_else(String::new, |node| {
+        if parent.is_empty() {
+            crate::marks::display_path(&app.root_path, app.home.as_deref())
+        } else {
+            node.name.to_string()
+        }
+    });
+    let metric = app.options.metric;
+    let mut panel = div()
+        .id("sibling-menu")
+        .debug_selector(|| "sibling-menu".into())
+        .occlude()
+        .flex()
+        .flex_col()
+        .w(size::SIBLING_MENU)
+        .max_h(size::SIBLING_MENU_HEIGHT)
+        .overflow_y_scroll()
+        .p(space::XS)
+        .bg(theme.surface)
+        .border_1()
+        .border_color(theme.control_border())
+        .shadow_lg()
+        .on_mouse_down_out(cx.listener(|this, _, _, cx| {
+            this.crumb_menu = None;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .px(space::SM)
+                .py(space::XS)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.8))
+                .child(format!("Siblings in {parent_name}")),
+        );
+    for (row_index, row) in rows.into_iter().enumerate() {
+        let current =
+            menu.as_ref().is_some_and(|menu| menu.current == row.index);
+        let highlighted = menu
+            .as_ref()
+            .is_some_and(|menu| menu.highlighted == row_index);
+        let parent = parent.to_vec();
+        let accent = palette::category_accent(theme, row.category);
+        let value = match metric {
+            Metric::Bytes => human_bytes(row.value),
+            Metric::Files => widgets::human_count(row.value),
+        };
+        panel = panel.child(
+            div()
+                .id(ElementId::Name(format!("sibling-{row_index}").into()))
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(space::MD)
+                .px(space::SM)
+                .py(space::XS)
+                .when(highlighted, |this| this.bg(theme.hover_fill()))
+                .hover(|style| style.bg(theme.hover_fill()))
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.choose_sibling(&parent, row.index, cx);
+                    window.focus(&this.focus, cx);
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_size(text::BODY)
+                        .text_color(if row.is_dir {
+                            theme.bright
+                        } else {
+                            theme.foreground
+                        })
+                        .when(current, |this| {
+                            this.font_weight(FontWeight::BOLD)
+                        })
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .text_ellipsis()
+                        .child(row.name),
+                )
+                .child(div().flex_shrink_0().w(size::ROW_BAR).child(
+                    widgets::bar(row.value as f32 / largest as f32, accent, cx),
+                ))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .w(size::SIZE_LANE)
+                        .flex()
+                        .justify_end()
+                        .text_size(text::BODY)
+                        .text_color(theme.secondary)
+                        .child(value),
+                ),
+        );
+    }
+    if more > 0 {
+        panel = panel.child(
+            div()
+                .px(space::SM)
+                .py(space::XS)
+                .text_size(text::CAPTION)
+                .text_color(theme.secondary.opacity(0.7))
+                .child(format!("+{more} smaller")),
+        );
+    }
+    panel
 }
 
 /// Four tiles in category colours, and the name.
@@ -512,53 +742,6 @@ fn trail_and_legend(
     theme: &Theme,
     cx: &Context<'_, Disktree>,
 ) -> Div {
-    let trail = app.breadcrumbs();
-    let last = trail.len().saturating_sub(1);
-    let mut crumbs = div()
-        .flex()
-        .flex_row()
-        .items_center()
-        .gap(space::XXS)
-        .flex_shrink_0();
-    let widening = app.scan.is_some() && app.scan_root != app.root_path;
-    for (index, (label, step)) in trail.into_iter().enumerate() {
-        // The root is its own separator: "/" then "home", not "/ / home".
-        if index > 1 {
-            crumbs = crumbs.child(
-                div()
-                    .text_color(theme.secondary.opacity(0.5))
-                    .text_size(text::BODY)
-                    .child("/"),
-            );
-        }
-        let id = ElementId::Name(SharedString::from(format!("crumb-{index}")));
-        let crumb = match step {
-            // Above the scan: dimmer, and a click widens the scan to there.
-            Crumb::Above(path) => {
-                let pending = widening && app.scan_root == path;
-                with_tooltip(
-                    widgets::crumb(id, label, false, cx)
-                        .text_color(if pending {
-                            palette::highlight(theme)
-                        } else {
-                            theme.secondary.opacity(0.7)
-                        })
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.widen_to(path.clone(), cx);
-                        })),
-                    "Scan from here · what is below is reused",
-                )
-                .into_any_element()
-            }
-            Crumb::Tree(path) => widgets::crumb(id, label, index == last, cx)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.go_to(path.clone(), cx);
-                }))
-                .into_any_element(),
-        };
-        crumbs = crumbs.child(crumb);
-    }
-
     let mut row = div()
         .flex()
         .flex_row()
@@ -566,11 +749,41 @@ fn trail_and_legend(
         .gap(space::LG)
         .px(space::LG)
         .py(space::SM)
-        .child(crumbs);
+        .child(scan_totals(app, theme));
     if app.find_open || !app.find.is_empty() {
         row = row.child(find_field(app, theme));
     }
     row.child(div().flex_1()).child(legend(app, theme, cx))
+}
+
+/// What the whole scan found, as one quiet line; unreadable paths are
+/// flagged in the warning colour when there are any.
+fn scan_totals(app: &Disktree, theme: &Theme) -> Div {
+    let tree = app.tree();
+    let bytes = tree.map_or(app.progress.bytes, |node| node.bytes);
+    let files = tree.map_or(app.progress.files, |node| node.files);
+    let dirs = tree.map_or(app.progress.dirs, |node| node.dirs);
+    let errors = app.progress.errors;
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap(space::SM)
+        .flex_shrink_0()
+        .text_size(text::CAPTION)
+        .text_color(theme.secondary)
+        .child(div().text_color(theme.foreground).child(human_bytes(bytes)))
+        .child(format!(
+            "· {} files · {} dirs",
+            widgets::human_count(files),
+            widgets::human_count(dirs)
+        ))
+        .when(errors > 0, |this| {
+            this.child(div().text_color(theme.warning).child(format!(
+                "· {} unreadable",
+                widgets::human_count(errors)
+            )))
+        })
 }
 
 /// The key to the colours: the categories, or the age ramp in age mode.

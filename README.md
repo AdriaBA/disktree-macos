@@ -49,11 +49,13 @@ disktree --help     # options: apparent size, follow links, skip hidden, …
 
 ### The screen
 
-- **Top:** the scan totals, then what is measured — **Size**, **Files** or
-  **Age**, **Hidden files**, **Apparent size**, and the depth drawn.
-- **Trail:** the path from `/`, and the legend. Everything below the scanned
-  root is a place to go; everything above it is dimmer, and clicking it
-  widens the scan to there (see below).
+- **Top:** the trail from `/`, then what is measured — **Size**, **Files** or
+  **Age**, **Hidden files**, **Apparent size**, and the depth drawn. In the
+  tree a crumb goes there, and its ▾ lists its siblings, largest first with
+  their share and size, to jump sideways (arrows and Enter work too). Above
+  the scanned root a crumb is dimmer, and clicking it widens the scan to
+  there (see below).
+- **Under it:** the scan totals, the filter when one is typed, and the legend.
 - **Mosaic:** colour is the *kind* of data — code, agent scratch,
   toolchains, synced files, git, media, documents, caches — at one muted
   level, lighter with depth. A diagonal hatch is space that can be had back

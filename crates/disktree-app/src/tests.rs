@@ -1005,3 +1005,99 @@ fn enter_before_the_search_lands_applies_it_when_it_does(
     assert_eq!(count, Some(2));
     assert!(!open);
 }
+
+#[gpui_kit::test]
+fn a_crumb_lists_its_siblings_and_jumps_sideways(cx: &mut TestAppContext) {
+    use gpui_kit::{Modifiers, MouseButton};
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    // Into junk, so the trail ends in a crumb that has siblings.
+    let junk = read(&view, cx, |app| {
+        app.tree()
+            .and_then(|tree| {
+                tree.children.iter().position(|c| &*c.name == "junk")
+            })
+            .expect("junk")
+    });
+    update(&view, cx, |app, cx| app.go_to(vec![junk], cx));
+    draw(cx);
+
+    let last = read(&view, cx, |app| app.breadcrumbs().len() - 1);
+    let chevron = cx
+        .debug_bounds(Box::leak(format!("crumb-{last}-menu").into_boxed_str()))
+        .expect("the current crumb has a menu");
+    cx.simulate_click(chevron.center(), Modifiers::none());
+    draw(cx);
+    assert!(
+        cx.debug_bounds("sibling-menu").is_some(),
+        "the menu is drawn"
+    );
+    let (names, highlighted) = read(&view, cx, |app| {
+        let menu = app.crumb_menu.clone().expect("open");
+        let (rows, _) = app.siblings(&menu.parent);
+        let names: Vec<String> =
+            rows.iter().map(|row| row.name.clone()).collect();
+        let highlighted = names_at(&names, menu.highlighted);
+        (names, highlighted)
+    });
+    assert!(
+        names.contains(&".cache".to_string())
+            && names.contains(&"keep".to_string())
+    );
+    assert_eq!(highlighted, "junk", "it opens on where you are");
+
+    // Walk to .cache by name, not by rank: it and junk are close in size.
+    let target = names
+        .iter()
+        .position(|name| name == ".cache")
+        .expect("listed");
+    let here = names
+        .iter()
+        .position(|name| name == "junk")
+        .expect("listed");
+    let key = if target < here { "up" } else { "down" };
+    for _ in 0..target.abs_diff(here) {
+        press(cx, key);
+    }
+    press(cx, "enter");
+    let (crumbs, open) = read(&view, cx, |app| {
+        (app.crumbs.clone(), app.crumb_menu.is_some())
+    });
+    let cache = read(&view, cx, |app| {
+        app.tree()
+            .and_then(|tree| {
+                tree.children.iter().position(|c| &*c.name == ".cache")
+            })
+            .expect(".cache")
+    });
+    assert_eq!(crumbs, vec![cache], "went sideways into .cache");
+    assert!(!open);
+
+    // A click outside closes it.
+    let chevron = cx
+        .debug_bounds(Box::leak(format!("crumb-{last}-menu").into_boxed_str()))
+        .expect("menu chevron");
+    cx.simulate_click(chevron.center(), Modifiers::none());
+    draw(cx);
+    assert!(read(&view, cx, |app| app.crumb_menu.is_some()));
+    cx.simulate_mouse_down(
+        gpui_kit::point(px(700.), px(600.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    cx.simulate_mouse_up(
+        gpui_kit::point(px(700.), px(600.)),
+        MouseButton::Left,
+        Modifiers::none(),
+    );
+    draw(cx);
+    assert!(read(&view, cx, |app| app.crumb_menu.is_none()));
+}
+
+fn names_at(names: &[String], index: usize) -> String {
+    names.get(index).cloned().unwrap_or_default()
+}
