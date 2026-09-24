@@ -17,7 +17,7 @@ jobs:
     name: Lint and test
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # What GPUI links against: windowing (Wayland, X11), input, fonts,
       # and the Vulkan loader.
