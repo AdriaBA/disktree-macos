@@ -20,7 +20,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 
 use rayon::Scope;
@@ -44,7 +44,11 @@ pub struct ScanOptions {
     /// Include dotfiles and dot-directories. On by default, like dust and `du`:
     /// `~/.cache` is frequently the largest directory in a home directory.
     pub include_hidden: bool,
-    /// Do not cross filesystem boundaries below the root.
+    /// Stay on the root's volume: skip other disks, pseudo filesystems,
+    /// network shares and automount points, but keep subvolumes of the same
+    /// disk. See [`crate::space::foreign_mounts`]. On by default: a disk
+    /// tool measures a disk, and its free-space meter only means anything
+    /// for one volume.
     pub one_filesystem: bool,
     /// Stop descending past this depth. Totals below that depth are then
     /// unknown, which makes an overview scan of a huge tree cheap.
@@ -61,7 +65,7 @@ impl Default for ScanOptions {
             apparent_size: false,
             follow_links: false,
             include_hidden: true,
-            one_filesystem: false,
+            one_filesystem: true,
             max_depth: None,
             dedup_hardlinks: true,
             metric: Metric::Bytes,
@@ -160,6 +164,7 @@ impl ScanHandle {
             options,
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
+            foreign_mounts: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
         });
@@ -206,6 +211,7 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
         options,
         progress: Arc::clone(&progress),
         root_device: Mutex::new(None),
+        foreign_mounts: OnceLock::new(),
         visited_dirs: Mutex::new(FxHashSet::default()),
         root: Mutex::new(None),
     });
@@ -217,8 +223,12 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
 struct WalkContext {
     options: ScanOptions,
     progress: Arc<ScanProgress>,
-    /// Device of the root, resolved once, only needed for `one_filesystem`.
+    /// Device of the root, resolved once: the `one_filesystem` fallback
+    /// when the mount table cannot be read.
     root_device: Mutex<Option<u64>>,
+    /// Mount points `one_filesystem` keeps out, from the mount table. Unset
+    /// when the table cannot be read, and devices are compared instead.
+    foreign_mounts: OnceLock<FxHashSet<PathBuf>>,
     /// Directories already entered, so followed symlinks cannot loop.
     visited_dirs: Mutex<FxHashSet<(u64, u64)>>,
     /// Set by the root's `complete`, read after the scope joins.
@@ -264,7 +274,15 @@ impl WalkContext {
         }
 
         if file_type.is_dir() {
-            if self.options.one_filesystem {
+            if self.options.one_filesystem
+                && let Some(foreign) = self.foreign_mounts.get()
+            {
+                // Checked by path before anything reads the directory, so an
+                // automount point is never triggered.
+                if foreign.contains(&path) {
+                    return Classified::Skipped;
+                }
+            } else if self.options.one_filesystem {
                 let device = entry.metadata().map(|meta| device_of(&meta));
                 match (device, self.root_device(&path)) {
                     (Ok(device), Some(root_device))
@@ -407,6 +425,9 @@ impl PendingDir {
             dirs: 1,
             inode: None,
             read_error: self.read_error.load(Ordering::Relaxed),
+            modified: 0,
+            category: crate::classify::Category::Other,
+            reclaim: None,
             children: std::mem::take(&mut *lock(&self.children)),
         }
     }
@@ -422,6 +443,10 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
     }
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
+        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+        if let Some(foreign) = crate::space::foreign_mounts_for(&root) {
+            let _ = context.foreign_mounts.set(foreign.into_iter().collect());
+        }
     }
     if context.options.follow_links
         && let Some(key) = file_identity(&root_meta)
@@ -529,6 +554,7 @@ fn finish_tree(mut node: Node, options: &ScanOptions) -> Node {
         mark_duplicate_hardlinks(&mut node, &mut seen);
     }
     aggregate(&mut node, options.metric);
+    crate::classify::classify(&mut node);
     node
 }
 
@@ -552,7 +578,19 @@ fn leaf_node(
 ) -> Node {
     let mut node = Node::entry(name, kind, size);
     node.inode = file_identity(meta);
+    node.modified = modified_seconds(meta);
     node
+}
+
+/// Last write time in Unix seconds, from the metadata the walk already has:
+/// age costs no extra system call.
+fn modified_seconds(meta: &Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 fn measure(meta: &Metadata, apparent_size: bool) -> u64 {
@@ -871,6 +909,7 @@ mod tests {
             options: options(),
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
+            foreign_mounts: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
         });
@@ -917,5 +956,33 @@ mod tests {
         assert!(snapshot.finished);
         assert_eq!(snapshot.files, 2);
         assert_eq!(snapshot.errors, 0);
+    }
+
+    /// A real whole-disk scan, run by hand: `cargo test -p disktree-core
+    /// -- --ignored --nocapture whole_disk`. Prints what it found, so the
+    /// volume rules can be checked against this machine's mounts.
+    #[test]
+    #[ignore = "walks the whole disk"]
+    fn whole_disk_smoke() {
+        let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
+        let root = crate::space::volume_root_for(&home).expect("a volume root");
+        let started = std::time::Instant::now();
+        let tree = scan(&root, ScanOptions::default()).expect("scan");
+        println!("root {} in {:.1?}", root.display(), started.elapsed());
+        println!(
+            "total {} files {}",
+            crate::size::human_bytes(tree.bytes),
+            tree.files
+        );
+        for child in tree.children.iter().take(14) {
+            println!(
+                "  {:>10}  {}",
+                crate::size::human_bytes(child.bytes),
+                child.name
+            );
+        }
+        let skipped =
+            crate::space::foreign_mounts_for(&root).unwrap_or_default();
+        println!("left out: {skipped:?}");
     }
 }

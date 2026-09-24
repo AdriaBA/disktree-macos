@@ -130,6 +130,40 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
 }
 
 /// Why this path must not be removed, if it must not.
+/// Trees the operating system owns. A whole-disk scan shows them, because
+/// they are part of what fills the disk, but files there belong to packages
+/// and removing them by hand breaks the system; pacman, paccache and
+/// `journalctl --vacuum` are the right tools. Refused even where
+/// permissions would allow it, and even inside them.
+const SYSTEM_TREES: [&str; 14] = [
+    "/bin",
+    "/boot",
+    "/dev",
+    "/etc",
+    "/lib",
+    "/lib64",
+    "/nix/store",
+    "/proc",
+    "/run",
+    "/sbin",
+    "/sys",
+    "/usr",
+    "/var/lib",
+    "/efi",
+];
+
+/// The system tree `path` is in, if any. The home directory is never
+/// system, wherever it lives.
+fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
+    if home.is_some_and(|home| path.starts_with(normalize(home))) {
+        return None;
+    }
+    SYSTEM_TREES
+        .iter()
+        .find(|tree| path.starts_with(tree))
+        .copied()
+}
+
 fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     if path.parent().is_none() {
         return Some("the filesystem root cannot be removed".into());
@@ -142,6 +176,11 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     }
     if !path.starts_with(root) {
         return Some("outside the scanned root".into());
+    }
+    if let Some(system) = system_tree(path, home) {
+        return Some(format!(
+            "part of the system under {system}: use the package manager"
+        ));
     }
     if is_mount_point(path) {
         return Some(
@@ -840,5 +879,36 @@ mod tests {
             assert_eq!(backend, TrashBackend::TrashPut);
         }
         assert!(backend.is_available());
+    }
+
+    #[test]
+    fn system_trees_are_refused_in_a_whole_disk_scan() {
+        let home = Path::new("/home/tobi");
+        assert_eq!(
+            system_tree(Path::new("/usr/lib/libfoo.so"), Some(home)),
+            Some("/usr")
+        );
+        assert_eq!(
+            system_tree(Path::new("/var/lib/pacman"), Some(home)),
+            Some("/var/lib")
+        );
+        assert_eq!(
+            system_tree(Path::new("/var/cache/pacman/pkg"), Some(home)),
+            None
+        );
+        assert_eq!(system_tree(Path::new("/opt/thing"), Some(home)), None);
+        assert_eq!(
+            system_tree(Path::new("/usrlocal"), Some(home)),
+            None,
+            "components, not prefixes"
+        );
+        let odd_home = Path::new("/usr/home/tobi");
+        assert_eq!(
+            system_tree(Path::new("/usr/home/tobi/.cache"), Some(odd_home)),
+            None
+        );
+        let reason =
+            refuse(Path::new("/etc/hosts"), Path::new("/"), Some(home));
+        assert!(reason.is_some_and(|reason| reason.contains("/etc")));
     }
 }

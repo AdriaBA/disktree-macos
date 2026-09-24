@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::classify::{Category, Reclaim};
+
 /// What a node represents on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NodeKind {
@@ -71,6 +73,14 @@ pub struct Node {
     pub inode: Option<(u64, u64)>,
     /// The directory could not be read; its contents are unknown.
     pub read_error: bool,
+    /// Newest write time at or beneath this node, in Unix seconds; `0` when
+    /// unknown. Derived for directories by [`aggregate`].
+    pub modified: i64,
+    /// What kind of data this is, for colour. Set by [`crate::classify`].
+    pub category: Category,
+    /// Why this space can be had back, if it can. Set by
+    /// [`crate::classify`]; inherited by everything beneath.
+    pub reclaim: Option<Reclaim>,
     /// Children, ordered by [`Metric`] value, descending.
     pub children: Vec<Self>,
 }
@@ -92,6 +102,9 @@ impl Node {
             dirs: 1,
             inode: None,
             read_error: false,
+            modified: 0,
+            category: Category::Other,
+            reclaim: None,
             children: Vec::new(),
         }
     }
@@ -112,6 +125,9 @@ impl Node {
             dirs: 0,
             inode: None,
             read_error: false,
+            modified: 0,
+            category: Category::Other,
+            reclaim: None,
             children: Vec::new(),
         }
     }
@@ -226,8 +242,10 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
     let mut own_bytes = 0;
     let mut own_files = 0;
     let mut dirs: u64 = 1;
+    let mut modified = 0;
     for child in &mut node.children {
         aggregate(child, metric);
+        modified = modified.max(child.modified);
         bytes += child.bytes;
         files += child.files;
         dirs += child.dirs;
@@ -241,6 +259,7 @@ pub fn aggregate(node: &mut Node, metric: Metric) {
     node.own_bytes = own_bytes;
     node.own_files = own_files;
     node.dirs = dirs;
+    node.modified = modified;
 
     // Largest first: a treemap lays out big tiles best, and the order is what
     // makes "descend into the largest child" meaningful.

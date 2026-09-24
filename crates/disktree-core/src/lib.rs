@@ -5,6 +5,8 @@
 //! hardlink de-duplication, aspect-ratio layout, and what may be deleted — can
 //! be built and tested without GPUI, a display, or a GPU.
 
+pub mod classify;
+pub mod insights;
 pub mod removal;
 pub mod scan;
 pub mod size;

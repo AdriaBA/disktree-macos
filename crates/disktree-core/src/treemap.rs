@@ -106,25 +106,33 @@ impl Tile {
 pub struct LayoutOptions {
     /// Nesting levels drawn at once; 1 draws only the root's children.
     pub max_depth: u32,
-    /// Gap between siblings and inset into a parent: what makes nesting
-    /// visible without a colour legend.
+    /// Gap between siblings inside a directory, and inset into it.
     pub padding: f32,
+    /// Gap between the top-level directories: wider than `padding`, so the
+    /// first level of structure reads before the detail inside it.
+    pub padding_outer: f32,
     /// Tiles below this many pixels are dropped; they cannot be read or hit.
     pub min_tile: f32,
     /// Children kept per directory. The tail merges into one `Others` tile.
     pub max_children: usize,
-    /// Height of the band a subdivided directory keeps for its own name.
+    /// Height of the band a top-level directory keeps for its name.
     pub header: f32,
+    /// Height of the slimmer band a deeper directory keeps when it is drawn
+    /// open. A directory drawn closed has no band: its label sits in its
+    /// corner, over nothing but its own fill.
+    pub header_inner: f32,
 }
 
 impl Default for LayoutOptions {
     fn default() -> Self {
         Self {
             max_depth: 3,
-            padding: 2.0,
+            padding: 1.0,
             min_tile: 5.0,
             max_children: 96,
-            header: 17.0,
+            padding_outer: 3.0,
+            header: 20.0,
+            header_inner: 15.0,
         }
     }
 }
@@ -189,7 +197,11 @@ fn place_children(
     }
 
     for (slot, raw) in squarify(&values, area).iter().enumerate() {
-        let rect = raw.inset(options.padding);
+        let rect = raw.inset(if depth == 0 {
+            options.padding_outer
+        } else {
+            options.padding
+        });
         if rect.w < options.min_tile || rect.h < options.min_tile {
             continue;
         }
@@ -248,16 +260,17 @@ fn place_children(
 /// The band a directory keeps for its name, or `None` when the tile is too
 /// small to leave its children a usable area below it.
 ///
-/// Deeper levels get a slimmer band: their names are shorter and their tiles
-/// are smaller.
+/// The top level gets the full header; deeper directories a slimmer band.
 fn header_band(
     rect: Rect,
     options: &LayoutOptions,
     depth: u32,
 ) -> Option<Rect> {
-    let height = (depth as f32)
-        .mul_add(-1.5, options.header)
-        .max(options.header * 0.6);
+    let height = if depth == 0 {
+        options.header
+    } else {
+        options.header_inner
+    };
     let body = rect.h - height;
     if rect.w < 44.0 || body < options.min_tile * 3.0 {
         return None;
