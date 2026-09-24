@@ -42,23 +42,37 @@ can drive (Vulkan).
 
 ```sh
 disktree            # scan the home directory
+disktree --disk     # the whole disk it lives on
 disktree ~/src      # or any directory
 disktree --help     # options: apparent size, follow links, skip hidden, …
 ```
 
 ### The screen
 
-- **Top:** the scan totals on the left; on the right, what is measured — rank
-  by **Size** or **Files**, **Hidden files**, **Apparent size**, and how many
-  levels are drawn. Below it, the breadcrumb: click any part to go there.
-- **Middle:** the treemap, using the full width of the window. Every directory
-  that is drawn open keeps a band at its top with its own name and size, and
-  its contents sit below that band — so a parent's name never covers a child,
-  and pointing at the band selects the parent.
-- **Bottom:** the tile you are acting on (name, path, size, its share of its
-  directory and of the scan, **Open**, **Mark for removal**); then the marked
-  total with **Review…**, the volume's free space now and after the marks, and
-  how much of the tree could be read.
+- **Top:** the scan totals, then what is measured — **Size**, **Files** or
+  **Age**, **Hidden files**, **Apparent size**, and the depth drawn.
+- **Trail:** the path as a clickable trail, and the
+  legend.
+- **Mosaic:** colour is the *kind* of data — code, agent scratch,
+  toolchains, synced files, git, media, documents, caches — at one muted
+  level, lighter with depth. A diagonal hatch is space that can be had back
+  (caches, sync history, package stores, build output), independent of
+  colour. Top-level directories carry a strip of their colour and a name
+  band; deeper open directories a slim label row. In **Age** mode colour is
+  the last write instead, from this week to older.
+- **Panel:** the selection (its size set large, share of the scan, files,
+  last write, and for a checkout what git says — changes, stashes, unpushed
+  commits); *Worth a look*, the largest things that could plausibly go;
+  what is marked; and the disk, free now and after the marks, with the way
+  to the review screen. Drag its left edge to resize it; double-click the
+  edge to reset.
+
+One colour is kept apart: amber marks the selection, the main action, and
+what can be had back.
+
+The kinds come from directory names and a few shapes (a bare git repository,
+`target` beside a `Cargo.toml`). Some of the names are specific to one
+machine; see `crates/disktree-core/src/classify.rs`.
 
 ### Marking
 
@@ -112,6 +126,7 @@ and shows how much free space was actually gained.
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
+| `g` | home directory or the whole disk |
 | `p` | show or hide the selection line |
 | `?` | every key |
 | `q` | quit |
@@ -133,6 +148,24 @@ scope per root, a completion counter per directory so no directory is built
 before its last subdirectory lands, and one bottom-up pass that aggregates sizes
 and removes duplicate hardlinks.
 
+## The whole disk
+
+**~ Home | / Whole disk** in the top bar, `g`, `disktree --disk`, or
+the launcher's *Scan the whole disk* action scans the disk your home
+directory lives on — `/` on Omarchy.
+
+A scan stays on one volume, and a volume is the mount *source*, not the
+device number: btrfs gives each subvolume its own `st_dev`, so `/home`,
+`/var/log` and `/var/cache/pacman/pkg` are included, while `/proc`,
+`/sys`, `/run`, tmpfs, `/boot`, other disks, network shares and automount
+points are left out (checked by path, so an automounted NAS is never
+mounted just to be measured). Snapshot subvolumes are left out too: their
+files share blocks with the live ones, and counting them would count the disk
+twice. `-X` crosses into everything.
+
+Without root, some system directories cannot be read; they are counted as
+unreadable in the top bar rather than guessed at.
+
 ## What it refuses to do
 
 The removal rules live in `crates/disktree-core/src/removal.rs`, and each one is
@@ -142,6 +175,9 @@ tested:
 - the filesystem root, the scanned root and your home directory are refused;
 - a mount point is refused, since removing it would reach into another
   filesystem;
+- system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, …) are
+  refused even where permissions would allow it: packages own them, and
+  pacman, paccache or `journalctl --vacuum` are the tools;
 - a symlink is unlinked, never followed;
 - nothing is passed through a shell — a file called `-rf` is just a file.
 
