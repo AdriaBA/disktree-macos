@@ -1,0 +1,816 @@
+//! End-to-end tests through the real window harness.
+//!
+//! These drive the application the way a person does — draw a frame, press
+//! keys, type — so they catch what unit tests on the state cannot: a screen
+//! that panics while painting, a binding that never fires, a removal that
+//! reports success without removing anything.
+
+use std::path::Path;
+
+use disktree_core::removal::RemovalMode;
+use disktree_core::scan::{ScanOptions, scan};
+use disktree_core::treemap::Tile;
+use gpui_kit::{
+    Bounds, Context, Entity, Pixels, Point, TestAppContext, VisualTestContext,
+    px,
+};
+use gpui_omarchy::Theme;
+
+use crate::state::{Disktree, Screen};
+
+/// A small tree on disk: two directories, a nested file, and a hidden one.
+///
+/// The hidden directory holds the largest file, which is both the common case
+/// in a home directory and the one the ranking has to get right.
+fn fixture() -> tempfile::TempDir {
+    let temp = tempfile::TempDir::new().expect("tempdir");
+    let root = temp.path();
+    for (path, bytes) in [
+        ("keep/notes.txt", 1_000_usize),
+        ("junk/blob.bin", 200_000),
+        ("junk/deeper/more.bin", 100_000),
+        (".cache/blob.bin", 300_000),
+    ] {
+        let file = root.join(path);
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("mkdir");
+        std::fs::write(&file, vec![b'x'; bytes]).expect("write");
+    }
+    temp
+}
+
+/// Apparent sizes, so the assertions are about the tree and not about how the
+/// filesystem rounds a small file up to a block.
+fn options() -> ScanOptions {
+    ScanOptions {
+        apparent_size: true,
+        ..ScanOptions::default()
+    }
+}
+
+type Window = VisualTestContext;
+
+/// Open a window over a real scan of `root`, without the background walk.
+fn view_over<'a>(
+    root: &Path,
+    cx: &'a mut TestAppContext,
+) -> (Entity<Disktree>, &'a mut Window) {
+    let tree = scan(root, options()).expect("scan the fixture");
+    let root_path = root.to_path_buf();
+    let (view, cx) = cx.add_window_view(move |_, cx| {
+        Disktree::with_tree(root_path.clone(), tree, options(), 3, cx)
+    });
+    let focus = view.read_with(cx, |app, _| app.focus.clone());
+    cx.update(|window, cx| window.focus(&focus, cx));
+    (view, cx)
+}
+
+fn draw(cx: &mut Window) {
+    cx.update(|window, cx| {
+        window.draw(cx).clear(cx);
+    });
+}
+
+fn press(cx: &mut Window, keys: &str) {
+    cx.simulate_keystrokes(keys);
+    draw(cx);
+}
+
+fn update<R>(
+    view: &Entity<Disktree>,
+    cx: &mut Window,
+    f: impl FnOnce(&mut Disktree, &mut Context<'_, Disktree>) -> R,
+) -> R {
+    view.update(cx, f)
+}
+
+fn read<R>(
+    view: &Entity<Disktree>,
+    cx: &Window,
+    f: impl FnOnce(&Disktree) -> R,
+) -> R {
+    view.read_with(cx, |app, _| f(app))
+}
+
+#[gpui_kit::test]
+fn the_window_draws_a_treemap_with_tiles(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let bounds: Bounds<Pixels> =
+        cx.debug_bounds("disktree-root").expect("root element");
+    assert!(bounds.size.width > px(0.) && bounds.size.height > px(0.));
+
+    let (size, tiles) = update(&view, cx, |app, _| {
+        (
+            app.treemap_size.get(),
+            app.layout().map(<[Tile]>::len).unwrap_or_default(),
+        )
+    });
+    assert!(size.width > px(0.), "treemap width {size:?}");
+    assert!(size.height > px(0.), "treemap height {size:?}");
+    assert!(tiles >= 3, "tiles laid out: {tiles}");
+}
+
+#[gpui_kit::test]
+fn the_first_scan_shows_what_it_is_doing_then_the_treemap(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let root = temp.path().to_path_buf();
+    // Through the real constructor, so this is the path every first run takes.
+    let (view, cx) =
+        cx.add_window_view(move |_, cx| Disktree::new(root, options(), 3, cx));
+    draw(cx);
+
+    // Nothing is known yet, so the viewport counts the walk instead of showing
+    // an empty mosaic.
+    assert!(read(&view, cx, |app| app.tree().is_none()));
+    assert!(cx.debug_bounds("disktree-root").is_some());
+
+    let epoch = read(&view, cx, |app| app.scan_epoch);
+    let mut ready = false;
+    for _ in 0..600 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        ready = update(&view, cx, |app, cx| {
+            app.poll_scan_once(epoch, cx);
+            app.tree().is_some()
+        });
+        if ready {
+            break;
+        }
+    }
+    assert!(ready, "the scan landed");
+    draw(cx);
+
+    let (tiles, selected, hidden_present) = update(&view, cx, |app, _| {
+        (
+            app.layout().map(<[Tile]>::len).unwrap_or_default(),
+            app.selected.is_some(),
+            app.tree().is_some_and(|tree| {
+                tree.children.iter().any(|c| c.name.starts_with('.'))
+            }),
+        )
+    });
+    assert!(tiles >= 3, "tiles after the scan: {tiles}");
+    assert!(
+        selected,
+        "the largest entry is selected for the selection line"
+    );
+    assert!(hidden_present, "hidden directories are part of the tree");
+}
+
+#[gpui_kit::test]
+fn keys_walk_the_tree_and_mark_what_is_selected(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // Largest first: .cache holds the biggest file.
+    let (selected, name) = read(&view, cx, |app| {
+        (
+            app.selected.clone(),
+            app.node_at(&[0]).map(|node| node.name.to_string()),
+        )
+    });
+    assert_eq!(selected, Some(vec![0]));
+    assert_eq!(name.as_deref(), Some(".cache"));
+
+    press(cx, "space");
+    let (marks, bytes) =
+        read(&view, cx, |app| (app.marks.len(), app.plan().bytes()));
+    assert_eq!(marks, 1);
+    assert_eq!(bytes, 300_000, "the whole hidden directory");
+
+    // Enter descends, Escape comes back out.
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.crumbs.is_empty()));
+    press(cx, "escape");
+    press(cx, "escape");
+    assert!(read(&view, cx, |app| app.crumbs.is_empty()));
+
+    // Space twice more leaves the mark as it was.
+    press(cx, "space");
+    press(cx, "space");
+    let marks = read(&view, cx, |app| app.marks.items().to_vec());
+    assert_eq!(marks.len(), 1);
+    assert_eq!(marks[0].bytes, 300_000);
+}
+
+#[gpui_kit::test]
+fn a_permanent_deletion_asks_in_an_alert_dialog_then_removes(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // Mark "junk" directly, which is what clicking its tile would do, and
+    // choose the permanent path: the trash path would reach the real trash.
+    update(&view, cx, |app, cx| {
+        app.removal_mode = RemovalMode::Permanent;
+        let junk = app
+            .tree()
+            .and_then(|tree| {
+                tree.children
+                    .iter()
+                    .position(|child| &*child.name == "junk")
+                    .map(|index| vec![index])
+            })
+            .expect("the junk directory");
+        app.select(Some(junk.clone()), cx);
+        app.toggle_mark(&junk, cx);
+        assert_eq!(app.plan().bytes(), 300_000);
+    });
+
+    press(cx, "c");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+
+    // Enter on the review screen opens the alert dialog; nothing is deleted.
+    press(cx, "enter");
+    assert!(read(&view, cx, |app| app.confirm_open));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    assert!(
+        temp.path().join("junk").exists(),
+        "nothing has happened yet"
+    );
+
+    // Enter in the dialog is its confirm action.
+    press(cx, "enter");
+    assert!(!read(&view, cx, |app| app.confirm_open));
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Running);
+
+    // The removal runs on a real worker thread, so the test drives the same
+    // poll the UI's ticker drives rather than waiting on the test clock.
+    let epoch = read(&view, cx, |app| app.run_epoch);
+    let mut finished = false;
+    for _ in 0..400 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        finished = update(&view, cx, |app, cx| {
+            app.poll_removal_once(epoch, cx);
+            app.screen == Screen::Done
+        });
+        if finished {
+            break;
+        }
+    }
+    assert!(finished, "the removal finished");
+    draw(cx);
+
+    let summary = read(&view, cx, |app| app.run_summary.clone());
+    assert_eq!(summary.removed, 1, "{summary:?}");
+    assert_eq!(summary.failed, 0, "{summary:?}");
+    assert!(
+        read(&view, cx, |app| app.marks.is_empty()),
+        "the list clears after the run"
+    );
+    assert!(!temp.path().join("junk").exists(), "junk is gone");
+    assert!(
+        temp.path().join("keep/notes.txt").exists(),
+        "an unmarked directory is untouched"
+    );
+    assert!(
+        temp.path().join(".cache/blob.bin").exists(),
+        "an unmarked hidden directory is untouched"
+    );
+}
+
+/// A subdivided directory keeps a band at the top for its own name, and its
+/// children start below it. That is what makes the inner tiles selectable: the
+/// parent's name never covers them.
+#[gpui_kit::test]
+fn a_parents_name_gets_its_own_band_above_its_children(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let (band, lowest_child_top, bands_in_mosaic) =
+        update(&view, cx, |app, _| {
+            let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
+            let parent = tiles
+                .iter()
+                .find(|tile| tile.crumbs() == [1])
+                .expect("the junk directory");
+            let band = parent
+                .header
+                .expect("junk is subdivided, so it keeps a band");
+            let children_top = tiles
+                .iter()
+                .filter(|tile| {
+                    tile.crumbs().starts_with(&[1]) && tile.crumbs().len() > 1
+                })
+                .map(|tile| tile.rect.y)
+                .fold(f32::INFINITY, f32::min);
+            let mosaic = app.prepare();
+            let bands_in_mosaic = mosaic
+                .labels
+                .iter()
+                .filter(|label| label.header.is_some())
+                .count();
+            (band, children_top, bands_in_mosaic)
+        });
+
+    assert!(
+        lowest_child_top >= band.bottom() - f32::EPSILON,
+        "children start at {} but the band ends at {}",
+        lowest_child_top,
+        band.bottom()
+    );
+    assert!(
+        band.h >= 8.0,
+        "a band has to be tall enough to read: {}",
+        band.h
+    );
+    assert!(
+        bands_in_mosaic >= 1,
+        "the parent's own label is placed in a band"
+    );
+}
+
+#[gpui_kit::test]
+fn hovering_reports_the_tile_under_the_pointer(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let (origin, biggest, centre) = update(&view, cx, |app, _| {
+        // A leaf tile, so "the deepest tile under the pointer" is unambiguous.
+        let biggest = app
+            .layout()
+            .and_then(|tiles| {
+                tiles
+                    .iter()
+                    .filter(|tile| {
+                        let crumbs = tile.crumbs();
+                        !tiles.iter().any(|other| {
+                            other.crumbs().len() > crumbs.len()
+                                && other.crumbs().starts_with(crumbs)
+                        })
+                    })
+                    .max_by(|left, right| {
+                        left.rect.area().total_cmp(&right.rect.area())
+                    })
+                    .map(|tile| tile.crumbs().to_vec())
+            })
+            .expect("a tile to hover");
+        let rect = app.tile_rect(&biggest).expect("a rectangle");
+        let screen = app.view.project(rect);
+        (
+            app.treemap_origin.get(),
+            biggest,
+            (screen.x + screen.w / 2.0, screen.y + screen.h / 2.0),
+        )
+    });
+
+    let (x, y) = centre;
+    cx.simulate_mouse_move(
+        Point::new(origin.x + px(x), origin.y + px(y)),
+        None,
+        gpui_kit::Modifiers::default(),
+    );
+    draw(cx);
+
+    let hovered = read(&view, cx, |app| app.hovered.clone());
+    assert_eq!(hovered.as_deref(), Some(biggest.as_slice()));
+}
+
+#[gpui_kit::test]
+fn typing_in_the_find_field_jumps_to_a_match(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    press(cx, "/");
+    assert!(read(&view, cx, |app| app.find_open));
+
+    cx.simulate_input("deeper");
+    draw(cx);
+    assert_eq!(read(&view, cx, |app| app.find.clone()), "deeper");
+
+    press(cx, "enter");
+    let (open, crumbs, selected) = read(&view, cx, |app| {
+        (app.find_open, app.crumbs.clone(), app.selected.clone())
+    });
+    assert!(!open);
+    assert_eq!(crumbs, vec![1], "the matched entry's parent is drawn");
+    // junk holds blob.bin (largest first) and then deeper, so the match sits at
+    // the second index: the find jumps to the entry, not to its rank.
+    assert_eq!(selected, Some(vec![1, 1]));
+}
+
+#[gpui_kit::test]
+fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    press(cx, "?");
+    assert!(read(&view, cx, |app| app.show_help));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.show_help));
+}
+
+#[gpui_kit::test]
+fn the_treemap_zooms_with_the_wheel_and_resets(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let middle = read(&view, cx, |app| {
+        let size = app.treemap_size.get();
+        Point::new(size.width / 2.0, size.height / 2.0)
+    });
+    update(&view, cx, |app, cx| {
+        app.zoom_at(middle.x.as_f32(), middle.y.as_f32(), 1.5, false, cx);
+    });
+    let zoomed = read(&view, cx, |app| app.view.scale);
+    assert!(zoomed > 1.0, "scale after zooming: {zoomed}");
+
+    press(cx, "0");
+    assert!((read(&view, cx, |app| app.view.scale) - 1.0).abs() < f32::EPSILON);
+}
+
+/// Both appearances Omarchy ships must draw: the palette is derived from the
+/// theme, so a light theme is a real second configuration.
+#[gpui_kit::test]
+fn both_appearances_draw(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    for theme in [Theme::tokyo_night(), Theme::flexoki_light()] {
+        view.update(cx, |_, cx| {
+            theme.clone().apply(cx);
+            cx.notify();
+        });
+        draw(cx);
+        assert!(cx.debug_bounds("disktree-root").is_some());
+    }
+}
+
+/// A view built without a scan keeps working: the screens must not assume a
+/// walk is in flight.
+#[gpui_kit::test]
+fn a_view_without_flags_or_marks_still_draws(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("disktree-root").is_some());
+
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Running;
+        cx.notify();
+    });
+    draw(cx);
+
+    update(&view, cx, |app, cx| {
+        app.screen = Screen::Done;
+        cx.notify();
+    });
+    draw(cx);
+    assert!(cx.debug_bounds("disktree-root").is_some());
+}
+
+/// The removal mode is a choice with two independent channels: the key and the
+/// button both have to reach the same state.
+#[gpui_kit::test]
+fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.marks.toggle(disktree_core::removal::Target {
+            path: temp.path().join("junk"),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+
+    press(cx, "m");
+    assert_eq!(read(&view, cx, |app| app.removal_mode), RemovalMode::Trash);
+    press(cx, "p");
+    assert_eq!(
+        read(&view, cx, |app| app.removal_mode),
+        RemovalMode::Permanent
+    );
+    press(cx, "!");
+    assert!(read(&view, cx, |app| app.marks.is_empty()));
+}
+
+/// Escape in the alert dialog cancels: the dialog closes, the review screen
+/// stays, and nothing on disk changes.
+#[gpui_kit::test]
+fn escape_in_the_delete_dialog_cancels(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.removal_mode = RemovalMode::Permanent;
+        app.marks.toggle(disktree_core::removal::Target {
+            path: temp.path().join("junk"),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+
+    press(cx, "enter");
+    assert!(read(&view, cx, |app| app.confirm_open));
+    press(cx, "escape");
+    assert!(!read(&view, cx, |app| app.confirm_open), "Escape cancels");
+    assert_eq!(read(&view, cx, |app| app.screen), Screen::Review);
+    assert!(temp.path().join("junk").exists());
+    assert_eq!(
+        read(&view, cx, |app| app.marks.len()),
+        1,
+        "the list is kept"
+    );
+}
+
+/// With a trash on the machine, the reversible path is the default and
+/// commits without a dialog; the permanent one is a deliberate choice.
+#[gpui_kit::test]
+fn the_trash_is_the_default_when_there_is_one(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    let (mode, available) = read(&view, cx, |app| {
+        (app.removal_mode, app.trash_backend.is_available())
+    });
+    if available {
+        assert_eq!(mode, RemovalMode::Trash);
+    } else {
+        assert_eq!(mode, RemovalMode::Permanent);
+    }
+}
+
+/// `ctrl =` / `ctrl -` / `ctrl 0` change the window's rem, which every size
+/// in the app is expressed in, and the mosaic's header band follows it.
+#[gpui_kit::test]
+fn interface_zoom_scales_the_rem_and_the_header_band(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+    let rem =
+        |cx: &mut Window| cx.update(|window, _| window.rem_size().as_f32());
+    let base = rem(cx);
+    let band = |view: &Entity<Disktree>, cx: &mut Window| {
+        update(view, cx, |app, _| {
+            app.layout();
+            app.layout_options.header
+        })
+    };
+    let base_band = band(&view, cx);
+
+    press(cx, "ctrl-=");
+    let zoomed = rem(cx);
+    assert!(zoomed > base, "{zoomed} after zooming in from {base}");
+    let zoomed_band = band(&view, cx);
+    assert!(
+        (zoomed_band / base_band - zoomed / base).abs() < 0.01,
+        "the band scales with the rem: {base_band} -> {zoomed_band}"
+    );
+
+    press(cx, "ctrl--");
+    press(cx, "ctrl--");
+    assert!(rem(cx) < base, "zooming out goes below the default");
+    press(cx, "ctrl-0");
+    assert!((rem(cx) - base).abs() < 0.01, "ctrl 0 resets");
+}
+
+/// The crumbs of the directory named `name` directly inside `parent`.
+fn child_crumbs(app: &Disktree, parent: &[usize], name: &str) -> Vec<usize> {
+    let node = app.node_at(parent).expect("the parent");
+    let index = node
+        .children
+        .iter()
+        .position(|child| &*child.name == name)
+        .unwrap_or_else(|| panic!("no {name}"));
+    let mut crumbs = parent.to_vec();
+    crumbs.push(index);
+    crumbs
+}
+
+/// Regression: the wheel magnified toward the deepest directory under the
+/// pointer, then went into the *top-level* one containing it, so the screen
+/// after the descent was never the area that was zoomed into.
+#[gpui_kit::test]
+fn the_wheel_goes_into_the_directory_it_zoomed_into(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // Point at the middle of junk/deeper's contents: a directory one level
+    // below a top-level one.
+    let (deeper, point) = update(&view, cx, |app, _| {
+        let junk = child_crumbs(app, &[], "junk");
+        let deeper = child_crumbs(app, &junk, "deeper");
+        let body = app.tile_body(&deeper).expect("deeper is drawn");
+        (deeper, (body.x + body.w / 2.0, body.y + body.h / 2.0))
+    });
+
+    let mut entered = None;
+    for _ in 0..40 {
+        let crumbs = update(&view, cx, |app, cx| {
+            let (x, y) = app.view.unproject(point.0, point.1);
+            let screen = app
+                .view
+                .project(disktree_core::treemap::Rect::new(x, y, 0.0, 0.0));
+            app.zoom_at(screen.x, screen.y, 1.15, true, cx);
+            app.crumbs.clone()
+        });
+        draw(cx);
+        if !crumbs.is_empty() {
+            entered = Some(crumbs);
+            break;
+        }
+    }
+    assert_eq!(
+        entered.as_deref(),
+        Some(deeper.as_slice()),
+        "descended into the pointed-at directory, not its top-level ancestor"
+    );
+}
+
+/// Regression, keyboard side: Enter on a deep selection enters that
+/// directory, and on a file enters the directory holding it.
+#[gpui_kit::test]
+fn enter_opens_the_selected_directory_at_any_depth(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let deeper = update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        let deeper = child_crumbs(app, &junk, "deeper");
+        app.select(Some(deeper.clone()), cx);
+        app.descend(cx);
+        deeper
+    });
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    press(cx, "escape");
+    press(cx, "escape");
+    press(cx, "escape");
+    let junk = update(&view, cx, |app, cx| {
+        app.go_to(Vec::new(), cx);
+        let junk = child_crumbs(app, &[], "junk");
+        let blob = child_crumbs(app, &junk, "blob.bin");
+        app.select(Some(blob), cx);
+        app.descend(cx);
+        junk
+    });
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        junk,
+        "a file opens its directory"
+    );
+}
+
+/// The mark key acts on what the pointer is over when the pointer moved
+/// last, and on the keyboard selection after an arrow.
+#[gpui_kit::test]
+fn the_mark_key_follows_the_pointer_until_the_keyboard_moves(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // Point at junk's name band, which belongs to junk itself (its body
+    // belongs to its children). junk is not the default selection, .cache.
+    let (keep, origin, centre) = update(&view, cx, |app, _| {
+        let keep = child_crumbs(app, &[], "junk");
+        let body = app
+            .layout()
+            .and_then(|tiles| {
+                tiles.iter().find(|tile| tile.crumbs() == keep.as_slice())
+            })
+            .and_then(|tile| tile.header)
+            .expect("junk is drawn with a band");
+        (
+            keep,
+            app.treemap_origin.get(),
+            (body.x + body.w / 2.0, body.y + body.h / 2.0),
+        )
+    });
+    assert_ne!(
+        read(&view, cx, |app| app.selected.clone()),
+        Some(keep.clone())
+    );
+    cx.simulate_mouse_move(
+        Point::new(origin.x + px(centre.0), origin.y + px(centre.1)),
+        None,
+        gpui_kit::Modifiers::default(),
+    );
+    draw(cx);
+
+    press(cx, "space");
+    let marked = read(&view, cx, |app| app.marks.items().to_vec());
+    assert_eq!(marked.len(), 1);
+    assert!(
+        marked[0].path.ends_with("junk"),
+        "marked what the pointer is on: {:?}",
+        marked[0].path
+    );
+    assert_eq!(read(&view, cx, |app| app.selected.clone()), Some(keep));
+
+    // An arrow hands control back to the keyboard selection.
+    press(cx, "right");
+    assert!(!read(&view, cx, |app| app.pointer_active));
+}
+
+/// Regression: after descending, tiles resolved against the scanned root
+/// instead of the directory drawn, so labels, hover and marks named strangers.
+#[gpui_kit::test]
+fn after_descending_every_tile_is_inside_the_directory_drawn(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    let junk = update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        app.select(Some(junk.clone()), cx);
+        app.descend(cx);
+        junk
+    });
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
+    draw(cx);
+
+    let (paths, labels) = update(&view, cx, |app, _| {
+        let tiles = app.layout().map(<[Tile]>::to_vec).unwrap_or_default();
+        let paths: Vec<_> = tiles
+            .iter()
+            .filter_map(|tile| app.path_at(tile.crumbs()))
+            .collect();
+        let labels: Vec<String> = app
+            .prepare()
+            .labels
+            .into_iter()
+            .map(|label| label.text)
+            .collect();
+        (paths, labels)
+    });
+    assert!(!paths.is_empty());
+    let junk_path = temp.path().join("junk");
+    for path in &paths {
+        assert!(path.starts_with(&junk_path), "{path:?} is outside junk");
+    }
+    for label in &labels {
+        assert!(
+            ["blob.bin", "deeper", "more.bin"].contains(&label.as_str())
+                || label.starts_with('+'),
+            "label {label} does not belong to junk"
+        );
+    }
+
+    // Space on the selection marks something inside junk, never elsewhere.
+    update(&view, cx, |app, cx| {
+        let blob = child_crumbs(app, &junk, "blob.bin");
+        app.select(Some(blob), cx);
+    });
+    press(cx, "space");
+    let marked = read(&view, cx, |app| app.marks.items().to_vec());
+    assert_eq!(marked.len(), 1);
+    assert_eq!(marked[0].path, junk_path.join("blob.bin"));
+    assert_eq!(marked[0].bytes, 200_000);
+
+    // And the mark is drawn on the right tile: its crumbs resolve here.
+    let hatched = update(&view, cx, |app, _| {
+        app.prepare()
+            .tiles
+            .iter()
+            .filter(|tile| tile.marked)
+            .count()
+    });
+    assert_eq!(hatched, 1, "exactly the marked tile is hatched");
+}
