@@ -1,0 +1,88 @@
+name: Release
+
+# Push a tag like v0.9.0 to build and publish a release. The tag must match
+# the workspace version in Cargo.toml.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build, e.g. v0.9.0"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish
+    # The oldest supported runner: its glibc is what the binary needs at
+    # least, so building here runs on the most systems.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Version
+        id: version
+        run: |
+          tag="${{ inputs.tag || github.ref_name }}"
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$tag" != "v$version" ]; then
+            echo "tag $tag does not match Cargo.toml version $version" >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: System libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo xtask test
+
+      - name: Build
+        run: cargo build --release --locked -p disktree-app
+
+      - name: Package
+        id: package
+        run: |
+          name="disktree-${{ steps.version.outputs.version }}-x86_64-linux"
+          mkdir -p "dist/$name"
+          cp target/release/disktree "dist/$name/"
+          strip "dist/$name/disktree"
+          cp packaging/install.sh packaging/disktree.desktop.in \
+             assets/disktree.svg README.md LICENSE "dist/$name/"
+          echo "${{ steps.version.outputs.version }}" > "dist/$name/VERSION"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
+          else
+            gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
+              --title "disktree ${TAG#v}" --generate-notes
+          fi

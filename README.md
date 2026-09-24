@@ -1,5 +1,7 @@
 # disktree
 
+![disktree: a home directory as a treemap, coloured by kind of data, with reclaimable space hatched and the selection, findings and free space in the side panel](assets/screenshot.png)
+
 Find what is filling a disk, mark what should go, and remove it — with the
 volume's free space in view the whole time.
 
@@ -13,9 +15,12 @@ Built with [GPUI](https://gpui-kit.com/) through
 [gpui-omarchy](https://github.com/huacnlee/gpui-omarchy), so it follows your
 Omarchy theme and behaves like the rest of the desktop.
 
-<!-- screenshot: assets/screenshot.png -->
-
 ## Install
+
+Download `disktree-*-x86_64-linux.tar.gz` from the
+[latest release](https://github.com/tobi/disktree/releases/latest), unpack
+it, and run `./install.sh` inside (or just copy `disktree` onto your
+`PATH`). Or build it:
 
 ```sh
 git clone https://github.com/tobi/disktree
