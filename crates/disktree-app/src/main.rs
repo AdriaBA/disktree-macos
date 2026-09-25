@@ -91,6 +91,12 @@ fn main() -> Result<()> {
                             ),
                             ..Default::default()
                         }),
+                        // Wayland app id. Hyprland reports it as the window
+                        // class, and the desktop entry's StartupWMClass and
+                        // the documented window rule both match `disktree`.
+                        // Left unset, the class is empty and that rule never
+                        // matches.
+                        app_id: Some("disktree".to_owned()),
                         // Below this the treemap stops being readable, so ask
                         // the compositor not to go there.
                         window_min_size: Some(size(px(900.), px(600.))),

@@ -202,7 +202,8 @@ tested:
 ## On Hyprland
 
 Hyprland tiles new windows, so disktree opens into whatever tile it is given.
-It is designed for a roomy window; float it, or give it a rule:
+It is designed for a roomy window; float it, or give it a rule. The window
+class is `disktree`.
 
 ```
 windowrule = float, class:^(disktree)$
