@@ -71,8 +71,15 @@ pub fn state(path: &Path) -> Option<GitState> {
         )?;
         Some(status.split('\0').filter(|line| !line.is_empty()).count())
     };
-    let stashes =
-        run(path, &["stash", "list"]).map_or(0, |list| list.lines().count());
+    // Counted from the reflog, not listed: `stash list` is `git log`, which
+    // verifies signatures with the checkout's `gpg.program` when its config
+    // sets `log.showSignature`.
+    let stashes = run(
+        path,
+        &["rev-list", "--walk-reflogs", "--count", "refs/stash"],
+    )
+    .and_then(|count| count.trim().parse().ok())
+    .unwrap_or(0);
     let unpushed = run(path, &["rev-list", "--count", "@{upstream}..HEAD"])
         .and_then(|count| count.trim().parse().ok());
     Some(GitState {
@@ -157,7 +164,9 @@ fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
         // fsmonitor on every `status`, hooks, a pager. Selecting a directory
         // in a disk viewer must not execute anything it contains, and a
         // command-line `-c` outranks the repository's config. (From
-        // tobi/disktree#10.)
+        // tobi/disktree#10.) Also a signature verifier, and whatever a
+        // partial clone would run to fetch a missing object: nothing here
+        // may reach the network either.
         .args([
             "-c",
             "core.fsmonitor=false",
@@ -165,11 +174,24 @@ fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
             "core.hooksPath=/dev/null",
             "-c",
             "core.pager=cat",
+            "-c",
+            "log.showSignature=false",
+            "-c",
+            "gpg.program=false",
+            "-c",
+            "gpg.ssh.program=false",
+            "-c",
+            "gpg.x509.program=false",
+            "-c",
+            "core.sshCommand=false",
+            "-c",
+            "protocol.allow=never",
         ])
         .args(args)
         // Never prompt, never page, never take a lock for the index refresh.
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_NO_LAZY_FETCH", "1")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -261,6 +283,68 @@ mod tests {
         assert!(git(&["config", "core.fsmonitor", &hook]));
         assert!(state(dir.path()).is_some());
         assert!(!marker.exists(), "the checkout's fsmonitor ran");
+    }
+
+    /// A signed stash and `log.showSignature`: listing stashes the way
+    /// `git stash list` does would run the checkout's `gpg.program`.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_cannot_make_git_verify_a_signature_with_its_program() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let gpg = dir.path().join("gpg.sh");
+        std::fs::write(
+            &gpg,
+            format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+        )
+        .expect("write gpg");
+        std::fs::set_permissions(&gpg, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let git = |args: &[&str], input: Option<&str>| {
+            use std::io::Write as _;
+            let mut child = Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .ok()?;
+            let mut stdin = child.stdin.take()?;
+            stdin.write_all(input.unwrap_or("").as_bytes()).ok()?;
+            drop(stdin);
+            let output = child.wait_with_output().ok()?;
+            output.status.success().then(|| {
+                String::from_utf8_lossy(&output.stdout).trim().to_owned()
+            })
+        };
+        if !git_installed() || git(&["init", "-q"], None).is_none() {
+            return; // no git on this machine
+        }
+        let tree = git(&["mktree"], None).expect("empty tree");
+        let commit = format!(
+            "tree {tree}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\
+             gpgsig -----BEGIN PGP SIGNATURE-----\n \n \
+             -----END PGP SIGNATURE-----\n\nstash\n"
+        );
+        let id = git(
+            &["hash-object", "-t", "commit", "-w", "--stdin"],
+            Some(&commit),
+        )
+        .expect("a signed commit");
+        assert!(
+            git(&["update-ref", "--create-reflog", "refs/stash", &id], None)
+                .is_some()
+        );
+        let gpg = gpg.to_string_lossy();
+        assert!(git(&["config", "log.showSignature", "true"], None).is_some());
+        assert!(git(&["config", "gpg.program", &gpg], None).is_some());
+
+        let state = state(dir.path()).expect("a checkout");
+        assert!(!marker.exists(), "the checkout's gpg.program ran");
+        assert_eq!(state.stashes, 1, "the stash is still counted");
     }
 
     #[cfg(unix)]
