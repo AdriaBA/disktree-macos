@@ -5,6 +5,12 @@
 //! live free-space meter. Marking is non-destructive until the review screen
 //! is confirmed.
 
+// A window, not a console program: on Windows, opening it from Explorer or
+// the Start menu should not bring a console window along. `main` attaches to
+// the console of a terminal it was started from, so `--help` and errors still
+// reach one. Ignored elsewhere.
+#![windows_subsystem = "windows"]
+
 mod app_menu;
 mod appearance;
 mod git;
@@ -58,6 +64,15 @@ options:
 ";
 
 fn main() -> Result<()> {
+    #[cfg(windows)]
+    console::attach();
+    let outcome = run();
+    #[cfg(windows)]
+    console::detach();
+    outcome
+}
+
+fn run() -> Result<()> {
     let args = parse_args()?;
     let root = args.root.clone();
     let depth = args.depth;
@@ -68,7 +83,7 @@ fn main() -> Result<()> {
         .run(move |cx| {
             gpui_omarchy::init(cx);
             app_menu::install(cx);
-            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let home = std::env::home_dir();
             let native_look = appearance::follows_system(home.as_deref());
             if native_look {
                 appearance::apply(cx.window_appearance(), cx);
@@ -191,21 +206,21 @@ fn parse_args() -> Result<Args> {
         !(disk && root.is_some()),
         "--disk and a PATH cannot be combined"
     );
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::home_dir();
     let root = match root {
         _ if disk => home
             .as_deref()
             .and_then(disktree_core::space::volume_root_for)
             .unwrap_or_else(|| PathBuf::from("/")),
         Some(root) => root,
-        None => std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .context("no path given and HOME is not set")?,
+        None => home.context("no path given and no home directory")?,
     };
     // Store the depth as the initial view setting rather than a scan option: it
     // is a display choice the run-time `[` and `]` keys also change.
-    // Canonical, so a later widening recognises this tree in the wider walk.
-    let root = root.canonicalize().unwrap_or(root);
+    // Canonical, so a later widening recognises this tree in the wider walk;
+    // through dunce, so Windows gets `C:\Users\…` rather than the `\\?\C:\…`
+    // form nothing else is written in.
+    let root = dunce::canonicalize(&root).unwrap_or(root);
     let metadata = std::fs::metadata(&root)
         .with_context(|| format!("cannot read {}", root.display()))?;
     anyhow::ensure!(metadata.is_dir(), "{} is not a directory", root.display());
@@ -215,4 +230,36 @@ fn parse_args() -> Result<Args> {
         options,
         depth: depth.clamp(1, 6),
     })
+}
+
+/// The console of the terminal disktree was started from, if any: a
+/// windowed program on Windows gets none of its own.
+#[cfg(windows)]
+mod console {
+    #![allow(
+        unsafe_code,
+        reason = "two Win32 calls that take no pointers to get wrong"
+    )]
+
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, FreeConsole,
+    };
+
+    /// Borrow the parent's console so printed text reaches it. Does
+    /// nothing when started from Explorer, which has none.
+    pub fn attach() {
+        // SAFETY: takes a process id by value, and failure only means
+        // there was no console to attach to.
+        unsafe {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+
+    /// Let go of it again, so the shell redraws its prompt.
+    pub fn detach() {
+        // SAFETY: no arguments; a process without a console is left as is.
+        unsafe {
+            FreeConsole();
+        }
+    }
 }

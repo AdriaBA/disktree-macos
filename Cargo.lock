@@ -1424,10 +1424,12 @@ version = "0.9.1"
 dependencies = [
  "anyhow",
  "disktree-core",
+ "dunce",
  "gpui-kit",
  "gpui-omarchy",
  "rustc-hash 2.1.3",
  "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1440,6 +1442,8 @@ dependencies = [
  "rustix",
  "tempfile",
  "trash",
+ "winapi-util",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

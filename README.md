@@ -86,6 +86,20 @@ NOTARY_PROFILE=<profile> cargo xtask bundle \
   --sign "Developer ID Application: Name (TEAMID)" --notarize
 ```
 
+### Windows
+
+On Windows 10 or 11, download `disktree-*-x86_64-windows.zip` from the same
+release, unpack it anywhere and run `disktree.exe`. Or build it with the MSVC
+toolchain (Visual Studio Build Tools, C++ workload):
+
+```powershell
+git clone https://github.com/tobi/disktree
+cd disktree
+cargo build --release    # target\release\disktree.exe
+```
+
+See [On Windows](#on-windows) for what differs there.
+
 ## Use
 
 ```sh
@@ -238,6 +252,31 @@ twice. `-X` crosses into everything.
 
 Without root, some system directories cannot be read; they are counted as
 unreadable in the top bar rather than guessed at.
+
+## On Windows
+
+The same program, with Windows' answers to the questions above:
+
+- **Disk usage** is the allocation NTFS reports for each file: whole
+  clusters, less for a compressed or sparse file, nothing for one small
+  enough to live in its file record. It arrives with the directory listing
+  itself (`FileIdExtdDirectoryInfo`), so it costs no more than the walk.
+  Hardlinks count once on NTFS.
+- **The whole disk** is the drive your profile is on, usually `C:\`. A
+  folder another volume is mounted on is a link, like a junction, and is
+  not entered, so a scan stays on one volume; `-l` follows links, and with
+  them mounted folders.
+- **Move to trash** is the Recycle Bin, through the shell, which asks
+  before destroying anything it cannot recycle.
+- **Refused besides the rules below:** Windows, Program Files and
+  ProgramData, what Windows keeps at the top of its drive (System Volume
+  Information, Recovery, Boot), and any folder holding your profile, such as
+  `C:\Users`. Names compare without regard to case, as Windows compares
+  them.
+- **Hidden** still means a name starting with a dot; the hidden attribute is
+  not consulted, so `-H` does not drop `AppData`.
+- **The theme** is gpui-omarchy's default, since there is no Omarchy theme
+  to follow.
 
 ## What it refuses to do
 

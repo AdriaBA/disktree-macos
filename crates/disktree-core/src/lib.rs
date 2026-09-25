@@ -15,3 +15,5 @@ pub mod size;
 pub mod space;
 pub mod tree;
 pub mod treemap;
+#[cfg(windows)]
+mod windows;

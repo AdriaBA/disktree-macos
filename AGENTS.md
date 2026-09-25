@@ -38,6 +38,8 @@ identifier there keys every macOS permission grant; do not change it lightly.
 
 `cargo xtask lint` is the gate. It must be green before anything is called
 done, and it must not fix anything: a red local run is the same signal CI gives.
+On Windows, where there is no make, run `cargo xtask lint`, `cargo xtask test`
+and `cargo build --release` directly; CI runs the gate on both systems.
 
 ## House rules
 
@@ -60,7 +62,8 @@ done, and it must not fix anything: a red local run is the same signal CI gives.
 ## Invariants
 
 1. **Sizes come from `st_blocks * 512` unless apparent size was asked for.**
-   That is the number that comes back when a file is deleted.
+   That is the number that comes back when a file is deleted. On Windows it
+   is the allocation the directory listing reports; see `windows.rs`.
 2. **`own_bytes`/`own_files` are derived, never tracked.** `tree::aggregate`
    computes the totals from the children. Hardlink de-duplication rewrites a
    leaf's weight and re-aggregates; anything that patches `bytes` directly will
@@ -69,7 +72,8 @@ done, and it must not fix anything: a red local run is the same signal CI gives.
    has finished.** That is the `+1` sentinel in `PendingDir::pending`. Building
    early silently drops whole subtrees — it has happened once.
 4. **Only paths under the scanned root may be removed**, and mount points, the
-   root, the home directory and symlink targets are refused.
+   root, the home directory, any directory holding it, and symlink targets are
+   refused.
 5. **Marks are keyed by absolute path**, not tree position, so they survive a
    re-scan; `Marks::refresh` re-reads their sizes and drops what is gone.
 6. **The treemap is painted, not composed of elements.** Thousands of
@@ -94,6 +98,7 @@ done, and it must not fix anything: a red local run is the same signal CI gives.
 | tile geometry, nesting, the merged tail | `crates/disktree-core/src/treemap.rs` |
 | anything that deletes, or refuses to | `crates/disktree-core/src/removal.rs` |
 | free space and projections | `crates/disktree-core/src/space.rs` |
+| what Windows lists, measures and compares differently | `crates/disktree-core/src/windows.rs` — the only `unsafe` |
 | a key, a screen transition, a mark | `crates/disktree-app/src/state.rs` |
 | spacing, type and size | `crates/disktree-app/src/ui.rs` — tokens only, no `px` in layout |
 | the mosaic's painting or labels | `crates/disktree-app/src/treemap_view.rs` |

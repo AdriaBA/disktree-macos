@@ -372,11 +372,13 @@ fn trail(app: &Disktree, theme: &Theme, cx: &Context<'_, Disktree>) -> Div {
 /// Steps a trail shows before it folds its middle into an ellipsis.
 const TRAIL_STEPS: usize = 7;
 
+/// The platform's path separator, so the trail reads like the paths shown
+/// elsewhere: `/` here, `\` on Windows.
 fn separator_glyph(theme: &Theme) -> Div {
     div()
         .text_color(theme.secondary.opacity(0.5))
         .text_size(text::BODY)
-        .child("/")
+        .child(std::path::MAIN_SEPARATOR_STR)
 }
 
 /// A crumb in the tree. Its label goes there (the current one opens the
@@ -2934,7 +2936,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 25] = [
+    let rows: [(&str, &str); 26] = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),

@@ -975,9 +975,11 @@ fn widening_reuses_the_tree_it_has_and_reads_only_the_rest(
     });
     let before = read(&view, cx, |app| app.tree().map(|tree| tree.files));
 
-    // The trail runs from "/", and the scanned root sits under its parents.
+    // The trail runs from the top of the filesystem — "/", or a drive such
+    // as "C:\" — and the scanned root sits under its parents.
     let trail = read(&view, cx, Disktree::breadcrumbs);
-    assert_eq!(trail[0].0, "/");
+    let top = temp.path().ancestors().last().expect("a top");
+    assert_eq!(trail[0].0, top.display().to_string());
     assert!(
         trail.contains(&(
             temp.path()
