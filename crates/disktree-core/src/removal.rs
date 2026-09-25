@@ -242,8 +242,15 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     if same(path, root) {
         return Some("the scanned root cannot be removed".into());
     }
-    if home.is_some_and(|home| same(path, &normalize(home))) {
-        return Some("the home directory cannot be removed".into());
+    if let Some(home) = home.map(normalize) {
+        if same(path, &home) {
+            return Some("the home directory cannot be removed".into());
+        }
+        // A directory goes with everything in it, so `/home` or `C:\Users`
+        // would take the home directory along.
+        if within(&home, path) {
+            return Some("it contains the home directory".into());
+        }
     }
     if !within(path, root) {
         return Some("outside the scanned root".into());
@@ -780,6 +787,24 @@ mod tests {
                 .iter()
                 .any(|blocked| blocked.reason.contains("home directory"))
                 || home.is_none()
+        );
+    }
+
+    /// Removing a directory takes what is inside it, so the directories
+    /// above home are refused too: in a whole-disk scan, `C:\Users` is an
+    /// ordinary directory, and so is `/home` without a separate volume.
+    #[test]
+    fn a_directory_holding_the_home_directory_is_refused() {
+        let home = Path::new("/home/tobi");
+        let reason = refuse(Path::new("/home"), Path::new("/"), Some(home));
+        assert!(
+            reason.is_some_and(|reason| reason.contains("home directory")),
+            "the home directory is inside it"
+        );
+        assert_eq!(
+            refuse(Path::new("/home/other"), Path::new("/"), Some(home)),
+            None,
+            "a sibling of home is not"
         );
     }
 

@@ -190,7 +190,9 @@ The removal rules live in `crates/disktree-core/src/removal.rs`, and each one is
 tested:
 
 - only paths under the scanned root can be removed;
-- the filesystem root, the scanned root and your home directory are refused;
+- the filesystem root, the scanned root and your home directory are refused,
+  and so is any directory holding your home directory, which would take it
+  along;
 - a mount point is refused, since removing it would reach into another
   filesystem;
 - system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, …) are

@@ -63,7 +63,8 @@ done, and it must not fix anything: a red local run is the same signal CI gives.
    has finished.** That is the `+1` sentinel in `PendingDir::pending`. Building
    early silently drops whole subtrees — it has happened once.
 4. **Only paths under the scanned root may be removed**, and mount points, the
-   root, the home directory and symlink targets are refused.
+   root, the home directory, any directory holding it, and symlink targets are
+   refused.
 5. **Marks are keyed by absolute path**, not tree position, so they survive a
    re-scan; `Marks::refresh` re-reads their sizes and drops what is gone.
 6. **The treemap is painted, not composed of elements.** Thousands of
