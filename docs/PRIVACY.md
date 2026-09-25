@@ -33,6 +33,11 @@ Disktree skips cloud-only files and folders exposed by iCloud Drive, Dropbox,
 and other File Provider services. A disk scan should not trigger a large cloud
 download.
 
+## Network access
+
+Disktree 0.10.0 scans and processes filesystem metadata on your Mac. It has no
+telemetry or network client and does not upload file paths or scan results.
+
 ## Removal
 
 - Marking a tile changes only Disktree's in-memory review list.
