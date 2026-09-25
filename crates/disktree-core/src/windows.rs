@@ -27,14 +27,16 @@ use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::{
     ERROR_INVALID_FUNCTION, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
-    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED,
+    ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FileIdExtdDirectoryInfo, GetDiskFreeSpaceExW,
-    GetFileInformationByHandleEx, GetVolumePathNameW, SYNCHRONIZE,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
+    FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
+    GetVolumePathNameW, GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
 };
 
 use crate::space::SpaceInfo;
@@ -112,6 +114,12 @@ impl Entry {
     /// Last write, in Unix seconds; `0` when earlier or unknown.
     pub const fn modified(&self) -> i64 {
         self.modified
+    }
+
+    /// Whether Explorer hides this: `FILE_ATTRIBUTE_HIDDEN`, as on
+    /// `AppData` and `$Recycle.Bin`.
+    pub const fn hidden(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_HIDDEN != 0
     }
 
     /// Whether this is a directory the cloud files provider holds and the
@@ -454,6 +462,68 @@ pub fn volume_root(path: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(OsString::from_wide(&root[..end])))
 }
 
+/// Every place a volume is mounted: drive roots such as `D:\`, and folders
+/// a volume is mounted on, such as `C:\Data\Disk2\`. The mount table
+/// Windows has in place of `/proc/self/mounts`.
+pub fn mount_points() -> Vec<PathBuf> {
+    let mut points = Vec::new();
+    // A volume GUID path, `\\?\Volume{…}\`, is 49 units with its NUL.
+    let mut volume = [0_u16; 64];
+    let length = u32::try_from(volume.len()).unwrap_or(u32::MAX);
+    // SAFETY: `volume` is writable for the length passed.
+    let find = unsafe { FindFirstVolumeW(volume.as_mut_ptr(), length) };
+    if find.is_null() || find == INVALID_HANDLE_VALUE {
+        return points;
+    }
+    loop {
+        points.extend(volume_paths(&volume));
+        // SAFETY: `find` is a live search handle, and `volume` is writable
+        // for the length passed.
+        if unsafe { FindNextVolumeW(find, volume.as_mut_ptr(), length) } == 0 {
+            break;
+        }
+    }
+    // SAFETY: `find` is a live search handle, closed once.
+    unsafe { FindVolumeClose(find) };
+    points
+}
+
+/// The paths the volume named by the NUL-terminated `volume` is mounted at.
+fn volume_paths(volume: &[u16]) -> Vec<PathBuf> {
+    let mut names = vec![0_u16; 1024];
+    loop {
+        let mut needed = 0_u32;
+        let Ok(length) = u32::try_from(names.len()) else {
+            return Vec::new();
+        };
+        // SAFETY: `volume` is NUL-terminated, `names` is writable for the
+        // length passed, and `needed` is a live `u32`.
+        let ok = unsafe {
+            GetVolumePathNamesForVolumeNameW(
+                volume.as_ptr(),
+                names.as_mut_ptr(),
+                length,
+                &raw mut needed,
+            )
+        };
+        if ok != 0 {
+            break;
+        }
+        // Too small: grow to what it asked for, once more at most.
+        let needed = usize::try_from(needed).unwrap_or(0);
+        if needed <= names.len() {
+            return Vec::new();
+        }
+        names.resize(needed, 0);
+    }
+    // NUL-separated names, ended by an empty one.
+    names
+        .split(|&unit| unit == 0)
+        .take_while(|name| !name.is_empty())
+        .map(|name| PathBuf::from(OsString::from_wide(name)))
+        .collect()
+}
+
 /// Whether `path` is a folder another volume is mounted on. Removing one
 /// would reach onto that volume, which nobody marked.
 pub fn is_mount_point(path: &Path) -> bool {
@@ -572,6 +642,19 @@ pub fn make_junction(link: &Path, target: &Path) -> bool {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn the_volume_list_has_the_system_drive() {
+        let drive =
+            std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
+        let root = PathBuf::from(drive).join(Component::RootDir.as_os_str());
+        let points = mount_points();
+        assert!(
+            points.iter().any(|point| same(point, &root)),
+            "{} not in {points:?}",
+            root.display()
+        );
+    }
 
     fn listed(dir: &Path) -> Vec<Entry> {
         let mut entries: Vec<Entry> = read_dir(dir)

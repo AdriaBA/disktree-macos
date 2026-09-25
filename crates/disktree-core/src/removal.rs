@@ -160,14 +160,17 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
 /// an app to the Trash is how macOS uninstalls it, and the apps macOS ships
 /// live on the read-only system volume anyway.
 #[cfg(not(windows))]
-const SYSTEM_TREES: [&str; 20] = [
+const SYSTEM_TREES: [&str; 24] = [
     "/bin",
     "/boot",
     "/dev",
     "/etc",
     "/lib",
     "/lib64",
+    "/lib32",
+    "/libx32",
     "/nix/store",
+    "/gnu/store",
     "/proc",
     "/run",
     "/sbin",
@@ -175,6 +178,8 @@ const SYSTEM_TREES: [&str; 20] = [
     "/usr",
     "/var/lib",
     "/efi",
+    // Homebrew on Linux, where it lives outside every user's home.
+    "/home/linuxbrew/.linuxbrew",
     // macOS.
     "/System",
     "/Library",
@@ -282,6 +287,11 @@ fn system_trees() -> Vec<PathBuf> {
             "Recovery",
             "Boot",
             "bootmgr",
+            // Windows' memory: turned off in Settings (`powercfg /h off` for
+            // hibernation), never deleted by hand.
+            "pagefile.sys",
+            "hiberfil.sys",
+            "swapfile.sys",
         ]
         .map(|name| drive.join(name)),
     );
@@ -566,32 +576,44 @@ pub fn prime_mount_points() {
     let _ = mount_points();
 }
 
-/// Read the mount points now: from `/proc/self/mounts`, or on macOS from
-/// `mount`, which has no `/proc`. Empty where neither can be read.
+/// Read the mount points now: from `/proc/self/mounts`, on macOS from
+/// `mount`, which has no `/proc`, and on Windows from the volume list.
+/// Empty where none can be read.
 fn read_mount_points() -> Vec<PathBuf> {
-    let points: Vec<PathBuf> =
-        if let Ok(table) = fs::read_to_string("/proc/self/mounts") {
-            crate::space::parse_mounts(&table)
-                .into_iter()
-                .map(|mount| mount.point)
-                .collect()
-        } else if cfg!(target_os = "macos") {
-            Command::new("/sbin/mount")
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| {
-                    crate::space::parse_macos_mounts(&String::from_utf8_lossy(
-                        &output.stdout,
-                    ))
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    let points: Vec<PathBuf> = if cfg!(windows) {
+        windows_mount_points()
+    } else if let Ok(table) = fs::read_to_string("/proc/self/mounts") {
+        crate::space::parse_mounts(&table)
+            .into_iter()
+            .map(|mount| mount.point)
+            .collect()
+    } else if cfg!(target_os = "macos") {
+        Command::new("/sbin/mount")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                crate::space::parse_macos_mounts(&String::from_utf8_lossy(
+                    &output.stdout,
+                ))
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     points.iter().map(|point| guard_key(point)).collect()
+}
+
+#[cfg(windows)]
+fn windows_mount_points() -> Vec<PathBuf> {
+    crate::windows::mount_points()
+}
+
+#[cfg(not(windows))]
+const fn windows_mount_points() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// A mount point strictly inside the path keyed `key`, if there is one. A
@@ -2114,6 +2136,8 @@ mod tests {
         assert!(system(r"Program Files (x86)\App").is_some());
         assert!(system(r"ProgramData\Vendor\state.db").is_some());
         assert!(system("System Volume Information").is_some());
+        assert!(system("pagefile.sys").is_some());
+        assert!(system("HIBERFIL.SYS").is_some());
         assert_eq!(system("Windows.old"), None, "components, not prefixes");
         assert_eq!(system(r"Users\tobi\AppData\Local\Temp"), None);
         assert_eq!(system("Games"), None);
@@ -2186,6 +2210,14 @@ mod tests {
         );
         assert_eq!(tree_of(Path::new("/var/cache/pacman/pkg"), home), None);
         assert_eq!(tree_of(Path::new("/opt/thing"), home), None);
+        assert_eq!(
+            tree_of(Path::new("/home/linuxbrew/.linuxbrew/Cellar"), home),
+            Some("/home/linuxbrew/.linuxbrew")
+        );
+        assert_eq!(
+            tree_of(Path::new("/gnu/store/abc-hello"), home),
+            Some("/gnu/store")
+        );
         assert_eq!(
             tree_of(Path::new("/usrlocal"), home),
             None,

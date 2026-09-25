@@ -293,7 +293,9 @@ impl WalkContext {
         };
         let name = entry.display_name();
 
-        if !self.options.include_hidden && name.starts_with('.') {
+        if !self.options.include_hidden
+            && (name.starts_with('.') || entry.hidden())
+        {
             return Classified::Skipped;
         }
 
@@ -461,6 +463,12 @@ trait Listed {
     fn facts(&self, apparent_size: bool) -> io::Result<Facts>;
     /// What a directory is, read before the walk enters it.
     fn directory(&self) -> io::Result<Directory>;
+    /// Hidden by an attribute rather than by a leading dot: on Windows,
+    /// where the listing carries it, so `AppData` is hidden as Explorer
+    /// hides it. macOS's `UF_HIDDEN` would cost a stat per entry.
+    fn hidden(&self) -> bool {
+        false
+    }
 }
 
 /// Whether [`Directory::evicted`] can ever be true here, so a platform that
@@ -583,6 +591,10 @@ impl Listed for crate::windows::Entry {
             device: 0,
             evicted: self.evicted(),
         })
+    }
+
+    fn hidden(&self) -> bool {
+        self.hidden()
     }
 }
 
@@ -1072,6 +1084,31 @@ mod tests {
         let default = scan_dir(root, &options());
         assert_eq!(default.bytes, 1000);
         assert_eq!(child(&default, ".cache").bytes, 900);
+
+        let without = scan_dir(
+            root,
+            &ScanOptions {
+                include_hidden: false,
+                ..options()
+            },
+        );
+        assert_eq!(without.bytes, 100);
+    }
+
+    /// Explorer's hidden attribute counts as hidden, as `AppData` has it.
+    #[cfg(windows)]
+    #[test]
+    fn the_hidden_attribute_hides_an_entry_on_windows() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = temp.path();
+        write(root, "AppData/blob.bin", 900);
+        write(root, "visible.bin", 100);
+        let marked = std::process::Command::new("attrib")
+            .arg("+h")
+            .arg(root.join("AppData"))
+            .status()
+            .is_ok_and(|status| status.success());
+        assert!(marked, "attrib +h");
 
         let without = scan_dir(
             root,

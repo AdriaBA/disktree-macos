@@ -41,7 +41,8 @@ make install
 removes exactly what was installed.
 
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
-can drive (Vulkan).
+can drive (Vulkan). Distributions often package an older Rust;
+[rustup](https://rustup.rs) installs a current one.
 
 ### macOS
 
@@ -52,7 +53,8 @@ newer. A release that was not signed and notarized is stopped by Gatekeeper
 the first time: open it once, then choose **Open Anyway** in System Settings
 › Privacy & Security.
 
-Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools:
+Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools.
+macOS does not come with Rust; install it with [rustup](https://rustup.rs).
 
 ```sh
 make install     # ~/Applications/disktree.app, and ~/.local/bin/disktree
@@ -89,8 +91,9 @@ NOTARY_PROFILE=<profile> cargo xtask bundle \
 ### Windows
 
 On Windows 10 or 11, download `disktree-*-x86_64-windows.zip` from the same
-release, unpack it anywhere and run `disktree.exe`. Or build it with the MSVC
-toolchain (Visual Studio Build Tools, C++ workload):
+release, unpack it anywhere and run `disktree.exe`. Or build it with Rust 1.97
+or newer, from [rustup](https://rustup.rs), and the MSVC toolchain (Visual
+Studio Build Tools, C++ workload):
 
 ```powershell
 git clone https://github.com/tobi/disktree
@@ -199,15 +202,17 @@ and shows how much free space was actually gained.
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
+| `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
-| `o` | show it in Finder or the file manager |
+| `o` | show it in Finder, File Explorer or the file manager |
 | `?` | every key |
 | `q` | quit |
 
-On macOS the menu bar also has ⌘O to open a folder, ⌘⇧R to show the
-selection in Finder, ⌘R to rescan, and ⌘Q, ⌘H and ⌘W (closing the window
-quits); other ⌘ chords are left to the system.
+On macOS the menu bar also has ⌘⇧R to show the selection in Finder, ⌘R to
+rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
+window quits); other ⌘ chords are left to the system. On Linux and Windows
+the same work with ctrl, with F5 to rescan too.
 
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
 commits, `esc` goes back.
@@ -270,13 +275,14 @@ The same program, with Windows' answers to the questions above:
   before destroying anything it cannot recycle.
 - **Refused besides the rules below:** Windows, Program Files and
   ProgramData, what Windows keeps at the top of its drive (System Volume
-  Information, Recovery, Boot), and any folder holding your profile, such as
+  Information, Recovery, Boot, and the page and hibernation files, which
+  Settings turns off), and any folder holding your profile, such as
   `C:\Users`. Names compare without regard to case, as Windows compares
   them.
-- **Hidden** still means a name starting with a dot; the hidden attribute is
-  not consulted, so `-H` does not drop `AppData`.
-- **The theme** is gpui-omarchy's default, since there is no Omarchy theme
-  to follow.
+- **Hidden** means a name starting with a dot, or the hidden attribute, so
+  `-H` drops `AppData` as Explorer hides it.
+- **The theme** follows Windows' light or dark setting, since there is no
+  Omarchy theme to follow. It does on macOS too, and on GNOME and KDE.
 
 ## What it refuses to do
 
@@ -293,7 +299,8 @@ tested:
 - a directory holding your home directory or a system tree is refused (on
   macOS `/Users` is on the same volume as `/`, and `/opt` holds
   `/opt/homebrew`);
-- system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, …) are
+- system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`,
+  `/gnu/store`, Homebrew's prefix on macOS and Linux, …) are
   refused even where permissions would allow it: packages own them, and
   pacman, paccache or `journalctl --vacuum` are the tools;
 - a symlink is unlinked, never followed;
