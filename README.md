@@ -41,7 +41,8 @@ make install
 removes exactly what was installed.
 
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
-can drive (Vulkan).
+can drive (Vulkan). Distributions often package an older Rust;
+[rustup](https://rustup.rs) installs a current one.
 
 ### macOS
 
@@ -52,7 +53,8 @@ newer. A release that was not signed and notarized is stopped by Gatekeeper
 the first time: open it once, then choose **Open Anyway** in System Settings
 › Privacy & Security.
 
-Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools:
+Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools.
+macOS does not come with Rust; install it with [rustup](https://rustup.rs).
 
 ```sh
 make install     # ~/Applications/disktree.app, and ~/.local/bin/disktree
@@ -89,8 +91,9 @@ NOTARY_PROFILE=<profile> cargo xtask bundle \
 ### Windows
 
 On Windows 10 or 11, download `disktree-*-x86_64-windows.zip` from the same
-release, unpack it anywhere and run `disktree.exe`. Or build it with the MSVC
-toolchain (Visual Studio Build Tools, C++ workload):
+release, unpack it anywhere and run `disktree.exe`. Or build it with Rust 1.97
+or newer, from [rustup](https://rustup.rs), and the MSVC toolchain (Visual
+Studio Build Tools, C++ workload):
 
 ```powershell
 git clone https://github.com/tobi/disktree
