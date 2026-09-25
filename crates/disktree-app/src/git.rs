@@ -157,7 +157,15 @@ fn run(path: &Path, args: &[&str]) -> Option<String> {
 }
 
 fn git(path: &Path, args: &[&str]) -> Option<std::process::Output> {
-    Command::new("git")
+    let mut command = Command::new("git");
+    // disktree is a GUI program on Windows, with no console to lend: without
+    // this, every probe flashes a console window of its own.
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(
+        &mut command,
+        0x0800_0000, // CREATE_NO_WINDOW
+    );
+    command
         .arg("-C")
         .arg(path)
         // A checkout's own config can name programs for git to run: an
