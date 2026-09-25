@@ -215,7 +215,12 @@ window quits); other ⌘ chords are left to the system. On Linux and Windows
 the same work with ctrl, with F5 to rescan too.
 
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
-commits, `esc` goes back.
+commits, `esc` goes back. Or hand the list on instead of acting on it: `s`
+saves it as a text file, one path per line, and `a` copies a prompt for a
+coding agent: free the space by removing what you picked, checking each path
+first (git work that exists nowhere else, a tool's own clean command) and
+touching nothing else. A name holding a newline is left out of the list and
+escaped in the prompt, so it cannot pass for another path.
 
 ## What it measures
 

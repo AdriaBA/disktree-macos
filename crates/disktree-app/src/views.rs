@@ -2341,7 +2341,46 @@ fn review_summary(
 
     panel
         .child(div().flex_1())
+        .children(notice_line(app, theme, cx))
+        .child(export_controls(plan, cx))
         .child(commit_controls(app, plan, cx))
+}
+
+/// The list handed on instead of acted on: saved as paths, or copied as a
+/// prompt for a coding agent to do the cleanup with care.
+fn export_controls(
+    plan: &disktree_core::removal::Plan,
+    cx: &Context<'_, Disktree>,
+) -> Div {
+    div()
+        .flex()
+        .flex_row()
+        .justify_end()
+        .gap(space::SM)
+        .child(
+            button(
+                "save-list",
+                "Save list\u{2026}",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .disabled(plan.is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.save_delete_list(cx);
+            })),
+        )
+        .child(
+            button(
+                "copy-prompt",
+                "Copy as prompt",
+                ButtonVariant::Secondary,
+                cx,
+            )
+            .disabled(plan.is_empty())
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.copy_agent_prompt(cx);
+            })),
+        )
 }
 
 /// The screen's one commitment. Moving to the trash is the default commit,
@@ -2410,6 +2449,8 @@ fn review_footer(app: &Disktree, theme: &Theme, cx: &App) -> Div {
         .child(widgets::hint("m", "trash", cx))
         .child(widgets::hint("p", "permanent", cx))
         .child(widgets::hint("!", "unmark all", cx))
+        .child(widgets::hint("s", "save list", cx))
+        .child(widgets::hint("a", "copy as prompt", cx))
         .child(widgets::hint("esc", "back", cx))
         .child(div().flex_1())
         .child(
@@ -2999,7 +3040,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("", ""),
         (
             "Review screen",
-            "m trash \u{00b7} p permanent \u{00b7} ! unmark all",
+            "m trash \u{00b7} p permanent \u{00b7} ! unmark all \u{00b7} s save list \u{00b7} a copy as prompt",
         ),
         ("", "enter commits \u{00b7} esc goes back"),
         ("", "A permanent deletion always asks first"),

@@ -2151,6 +2151,74 @@ impl Disktree {
         .detach();
     }
 
+    /// Save what the plan would act on as a list of paths, one per line,
+    /// wherever the user chooses: for a script, or for later.
+    pub fn save_delete_list(&mut self, cx: &mut Context<'_, Self>) {
+        let plan = self.plan();
+        if plan.is_empty() {
+            self.notice = Some(("nothing to save".into(), Status::Warning));
+            cx.notify();
+            return;
+        }
+        let list = disktree_core::export::delete_list(&plan.targets);
+        let count = plan.targets.len();
+        let directory =
+            self.home.clone().unwrap_or_else(|| self.root_path.clone());
+        let chosen = cx
+            .prompt_for_new_path(&directory, Some("disktree-delete-list.txt"));
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(path))) = chosen.await else {
+                return;
+            };
+            let notice = match std::fs::write(&path, list) {
+                Ok(()) => (
+                    format!(
+                        "saved {count} {} to {}",
+                        if count == 1 { "path" } else { "paths" },
+                        path.display()
+                    ),
+                    Status::Success,
+                ),
+                Err(error) => (
+                    format!("could not save {}: {error}", path.display()),
+                    Status::Error,
+                ),
+            };
+            let _ = this.update(cx, |this, cx| {
+                this.notice = Some(notice);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Copy instructions for a coding agent to free the space by removing
+    /// what the plan would act on, after checking each path.
+    pub fn copy_agent_prompt(&mut self, cx: &mut Context<'_, Self>) {
+        let plan = self.plan();
+        if plan.is_empty() {
+            self.notice = Some(("nothing to copy".into(), Status::Warning));
+            cx.notify();
+            return;
+        }
+        let prompt = disktree_core::export::agent_prompt(
+            &plan.targets,
+            &self.root_path,
+            self.space,
+        );
+        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(prompt));
+        let count = plan.targets.len();
+        self.notice = Some((
+            format!(
+                "copied a prompt for your agent: {count} {}, {}",
+                if count == 1 { "path" } else { "paths" },
+                disktree_core::size::human_bytes(plan.bytes())
+            ),
+            Status::Success,
+        ));
+        cx.notify();
+    }
+
     /// Show the tile a key acts on in Finder (or the file manager), selected.
     pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
         let crumbs =
@@ -2400,6 +2468,8 @@ impl Disktree {
                 self.removal_mode = RemovalMode::Trash;
                 cx.notify();
             }
+            "s" => self.save_delete_list(cx),
+            "a" => self.copy_agent_prompt(cx),
             "?" => {
                 self.show_help = true;
                 cx.notify();

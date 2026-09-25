@@ -594,6 +594,46 @@ fn the_review_screen_switches_removal_mode(cx: &mut TestAppContext) {
     assert!(read(&view, cx, |app| app.marks.is_empty()));
 }
 
+/// `a` on the review screen copies a prompt for an agent naming the marked
+/// path, and removes nothing.
+#[gpui_kit::test]
+fn the_review_screen_copies_the_list_as_an_agent_prompt(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let junk = temp.path().join("junk");
+    let (view, cx) = view_over(temp.path(), cx);
+    update(&view, cx, |app, cx| {
+        app.marks.toggle(disktree_core::removal::Target {
+            path: junk.clone(),
+            bytes: 300_000,
+            is_dir: true,
+            hidden: false,
+        });
+        app.screen = Screen::Review;
+        cx.notify();
+    });
+    draw(cx);
+
+    press(cx, "a");
+    let copied = cx
+        .read_from_clipboard()
+        .and_then(|item| item.text())
+        .expect("a prompt on the clipboard");
+    assert!(copied.contains("free up disk space"), "{copied}");
+    assert!(
+        copied.contains(&format!("- {}", junk.display())),
+        "{copied}"
+    );
+    assert!(junk.exists(), "nothing was removed");
+    let notice = read(&view, cx, |app| app.notice.clone());
+    assert!(
+        notice.is_some_and(|(message, _)| message.contains("copied")),
+        "the copy is confirmed"
+    );
+}
+
 /// Escape in the alert dialog cancels: the dialog closes, the review screen
 /// stays, and nothing on disk changes.
 #[gpui_kit::test]
