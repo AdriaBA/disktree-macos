@@ -191,8 +191,9 @@ tested:
 
 - only paths under the scanned root can be removed;
 - the filesystem root, the scanned root and your home directory are refused;
-- a mount point is refused, since removing it would reach into another
-  filesystem;
+- a mount point is refused, and so is anything with a mount point inside it,
+  since removing it would reach into another filesystem; permanent deletion
+  also stops at a device boundary rather than descending into one;
 - system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, …) are
   refused even where permissions would allow it: packages own them, and
   pacman, paccache or `journalctl --vacuum` are the tools;
