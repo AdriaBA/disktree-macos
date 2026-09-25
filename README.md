@@ -17,7 +17,7 @@ Omarchy theme and behaves like the rest of the desktop.
 
 ## Install
 
-Download `disktree-*-x86_64-linux.tar.gz` from the
+Download `disktree-*-x86_64-linux.tar.gz` (`aarch64-linux` on ARM) from the
 [latest release](https://github.com/tobi/disktree/releases/latest), unpack
 it, and run `./install.sh` inside (or just copy `disktree` onto your
 `PATH`). Or build it:
@@ -46,12 +46,12 @@ can drive (Vulkan). Distributions often package an older Rust;
 
 ### macOS
 
-Download `disktree-*-aarch64-macos.zip` from the
-[latest release](https://github.com/tobi/disktree/releases/latest), unzip it,
-and drag `disktree.app` into Applications. Apple silicon and macOS 11 or
-newer. A release that was not signed and notarized is stopped by Gatekeeper
-the first time: open it once, then choose **Open Anyway** in System Settings
-› Privacy & Security.
+Download `disktree-*-aarch64-macos.zip` (`x86_64-macos` for an Intel Mac)
+from the [latest release](https://github.com/tobi/disktree/releases/latest),
+unzip it, and drag `disktree.app` into Applications. macOS 11 or newer. A
+release that was not signed and notarized is stopped by Gatekeeper the first
+time: open it once, then choose **Open Anyway** in System Settings › Privacy
+& Security.
 
 Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools.
 macOS does not come with Rust; install it with [rustup](https://rustup.rs).
@@ -90,10 +90,11 @@ NOTARY_PROFILE=<profile> cargo xtask bundle \
 
 ### Windows
 
-On Windows 10 or 11, download `disktree-*-x86_64-windows.zip` from the same
-release, unpack it anywhere and run `disktree.exe`. Or build it with Rust 1.97
-or newer, from [rustup](https://rustup.rs), and the MSVC toolchain (Visual
-Studio Build Tools, C++ workload):
+On Windows 10 or 11, download `disktree-*-x86_64-windows.zip`
+(`aarch64-windows` on ARM) from the same release, unpack it anywhere and run
+`disktree.exe`. Or build it with Rust 1.97 or newer, from
+[rustup](https://rustup.rs), and the MSVC toolchain (Visual Studio Build
+Tools, C++ workload):
 
 ```powershell
 git clone https://github.com/tobi/disktree
