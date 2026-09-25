@@ -771,14 +771,22 @@ fn run(
     let mut removed = 0_u64;
     let mut bytes = 0_u64;
     let mut failed = 0_usize;
+    // The plan was judged against a mount table up to `MOUNTS_FRESH` old,
+    // or, right after start, not read yet. Judged again against a fresh
+    // read, here on the worker, before anything is touched.
+    let mounts = read_mount_points();
 
     for target in &plan.targets {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let outcome = match mode {
-            RemovalMode::Permanent => remove_permanently(&target.path),
-            RemovalMode::Trash => move_to_trash(&target.path, backend),
+        let outcome = if let Some(reason) = mounted(&target.path, &mounts) {
+            Err(io::Error::other(reason))
+        } else {
+            match mode {
+                RemovalMode::Permanent => remove_permanently(&target.path),
+                RemovalMode::Trash => move_to_trash(&target.path, backend),
+            }
         };
         if outcome.is_ok() {
             removed += 1;
@@ -800,6 +808,21 @@ fn run(
     });
 }
 
+/// Why `path` would reach into another filesystem, if it would: the
+/// mount-point rules of [`refuse`], asked again at removal time.
+fn mounted(path: &Path, mounts: &[PathBuf]) -> Option<String> {
+    if is_mount_point(path) {
+        return Some("it became a mount point since it was marked".into());
+    }
+    mount_below(&guard_key(path), mounts).map(|mount| {
+        format!(
+            "{} is mounted inside it: removing it would reach into another \
+             filesystem",
+            mount.display()
+        )
+    })
+}
+
 /// `rm -rf --one-file-system` semantics: a symlink is unlinked, never
 /// followed, and nothing on another filesystem is touched.
 ///
@@ -809,16 +832,87 @@ fn run(
 /// `O_NOFOLLOW`, and one on a different device or mount stops the removal.
 /// (From tobi/disktree#10.)
 ///
+/// The same goes for the way down to `path`: see [`open_parent`].
 #[cfg(unix)]
 pub fn remove_permanently(path: &Path) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
-    if !meta.is_dir() {
-        return fs::remove_file(path);
+    use rustix::fs::{AtFlags, FileType, statat, unlinkat};
+
+    let (parent, name) = open_parent(path)?;
+    let stat = statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
+        unlinkat(&parent, name, AtFlags::empty())?;
+        return Ok(());
     }
-    let dir = open_dir(rustix::fs::CWD, path)?;
+    let dir = open_dir(&parent, name)?;
     let top = Volume::of(&dir)?;
     remove_contents(&dir, &top, path)?;
-    fs::remove_dir(path)
+    drop(dir);
+    unlinkat(&parent, name, AtFlags::REMOVEDIR)?;
+    Ok(())
+}
+
+/// The directory holding `path`, and `path`'s own name in it.
+///
+/// Opened one component at a time from `/`, none of them followed if it is
+/// a symlink. The scanned root is canonical, so no marked path has a symlink
+/// on its way down; one that does now was put there after the scan, and
+/// following it would remove whatever it points to — a directory swapped
+/// for a link to `~` would take `~/x` in place of the `/tmp/d/x` that was
+/// marked. `rm -rf` has the same race; this closes it.
+#[cfg(unix)]
+fn open_parent(
+    path: &Path,
+) -> io::Result<(std::os::fd::OwnedFd, &std::ffi::OsStr)> {
+    use rustix::io::Errno;
+
+    let not_marked = || {
+        io::Error::other(format!(
+            "{} is not an absolute, normalized path",
+            path.display()
+        ))
+    };
+    let name = path.file_name().ok_or_else(not_marked)?;
+    let parent = path.parent().ok_or_else(not_marked)?;
+    let mut dir = open_step(rustix::fs::CWD, "/")?;
+    for component in parent.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(part) => {
+                dir = open_step(&dir, part).map_err(|error| match error {
+                    Errno::LOOP | Errno::NOTDIR => io::Error::other(format!(
+                        "{} changed since the scan: {} is no longer a \
+                         directory, so nothing was removed",
+                        path.display(),
+                        part.display()
+                    )),
+                    error => error.into(),
+                })?;
+            }
+            _ => return Err(not_marked()),
+        }
+    }
+    Ok((dir, name))
+}
+
+/// Open a directory on the way down to a target, not following a symlink.
+/// Only a handle to walk through: on Linux `O_PATH`, which needs no read
+/// permission, just as a path lookup does not.
+#[cfg(unix)]
+fn open_step<P: rustix::path::Arg>(
+    parent: impl std::os::fd::AsFd,
+    name: P,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, openat};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access = OFlags::PATH;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let access = OFlags::RDONLY;
+    openat(
+        parent,
+        name,
+        access | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
 }
 
 #[cfg(not(unix))]
@@ -1515,6 +1609,34 @@ mod tests {
         remove_permanently(&link).expect("remove link");
         assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
         assert!(keep.path().join("precious.bin").exists());
+    }
+
+    /// Marked as `a/b/x`, then `a/b` swapped for a link to somewhere else
+    /// holding an `x`: that other `x` must survive.
+    #[test]
+    #[cfg(unix)]
+    fn permanent_removal_does_not_follow_a_link_put_on_the_way_down() {
+        let temp = tree();
+        let keep = TempDir::new().expect("tempdir");
+        fs::create_dir(keep.path().join("x")).expect("mkdir");
+        fs::write(keep.path().join("x/precious.bin"), b"data").expect("write");
+        let marked = temp.path().join("a/b/x");
+        fs::remove_dir_all(temp.path().join("a/b")).expect("clear");
+        link_dir(keep.path(), &temp.path().join("a/b"));
+
+        let error = remove_permanently(&marked).expect_err("refused");
+        assert!(error.to_string().contains("changed since"), "{error}");
+        assert!(keep.path().join("x/precious.bin").exists());
+    }
+
+    #[test]
+    fn a_mount_below_a_target_is_caught_again_at_removal_time() {
+        let temp = tree();
+        let root = temp.path();
+        let mounts = vec![guard_key(&root.join("a/b"))];
+        let reason = mounted(&root.join("a"), &mounts).expect("caught");
+        assert!(reason.contains("mounted inside"), "{reason}");
+        assert_eq!(mounted(&root.join("other"), &mounts), None);
     }
 
     /// Git keeps its objects read-only, which on Windows stops a plain
