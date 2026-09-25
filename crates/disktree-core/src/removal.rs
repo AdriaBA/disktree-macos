@@ -566,32 +566,44 @@ pub fn prime_mount_points() {
     let _ = mount_points();
 }
 
-/// Read the mount points now: from `/proc/self/mounts`, or on macOS from
-/// `mount`, which has no `/proc`. Empty where neither can be read.
+/// Read the mount points now: from `/proc/self/mounts`, on macOS from
+/// `mount`, which has no `/proc`, and on Windows from the volume list.
+/// Empty where none can be read.
 fn read_mount_points() -> Vec<PathBuf> {
-    let points: Vec<PathBuf> =
-        if let Ok(table) = fs::read_to_string("/proc/self/mounts") {
-            crate::space::parse_mounts(&table)
-                .into_iter()
-                .map(|mount| mount.point)
-                .collect()
-        } else if cfg!(target_os = "macos") {
-            Command::new("/sbin/mount")
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-                .filter(|output| output.status.success())
-                .map(|output| {
-                    crate::space::parse_macos_mounts(&String::from_utf8_lossy(
-                        &output.stdout,
-                    ))
-                })
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+    let points: Vec<PathBuf> = if cfg!(windows) {
+        windows_mount_points()
+    } else if let Ok(table) = fs::read_to_string("/proc/self/mounts") {
+        crate::space::parse_mounts(&table)
+            .into_iter()
+            .map(|mount| mount.point)
+            .collect()
+    } else if cfg!(target_os = "macos") {
+        Command::new("/sbin/mount")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .map(|output| {
+                crate::space::parse_macos_mounts(&String::from_utf8_lossy(
+                    &output.stdout,
+                ))
+            })
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     points.iter().map(|point| guard_key(point)).collect()
+}
+
+#[cfg(windows)]
+fn windows_mount_points() -> Vec<PathBuf> {
+    crate::windows::mount_points()
+}
+
+#[cfg(not(windows))]
+const fn windows_mount_points() -> Vec<PathBuf> {
+    Vec::new()
 }
 
 /// A mount point strictly inside the path keyed `key`, if there is one. A
