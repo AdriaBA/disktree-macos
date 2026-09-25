@@ -33,8 +33,12 @@ jobs:
 
       - name: Version
         id: version
+        # Through the environment, not spliced into the script: a tag typed
+        # into the dispatch form is text, never shell.
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="$TAG"
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "$tag" != "v$version" ]; then
             echo "tag $tag does not match Cargo.toml version $version" >&2
@@ -118,8 +122,12 @@ jobs:
 
       - name: Version
         id: version
+        # Through the environment, not spliced into the script: a tag typed
+        # into the dispatch form is text, never shell.
+        env:
+          TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="$TAG"
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "$tag" != "v$version" ]; then
             echo "tag $tag does not match Cargo.toml version $version" >&2
