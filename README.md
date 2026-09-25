@@ -202,15 +202,17 @@ and shows how much free space was actually gained.
 | `d` | disk usage or apparent size |
 | `i` | include or skip hidden entries |
 | `r` | scan again |
+| `ctrl o` (`⌘O` on macOS) | choose another directory to scan |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
-| `o` | show it in Finder or the file manager |
+| `o` | show it in Finder, File Explorer or the file manager |
 | `?` | every key |
 | `q` | quit |
 
-On macOS the menu bar also has ⌘O to open a folder, ⌘⇧R to show the
-selection in Finder, ⌘R to rescan, and ⌘Q, ⌘H and ⌘W (closing the window
-quits); other ⌘ chords are left to the system.
+On macOS the menu bar also has ⌘⇧R to show the selection in Finder, ⌘R to
+rescan, ⌘[ and ⌘] for back and forward, and ⌘Q, ⌘H and ⌘W (closing the
+window quits); other ⌘ chords are left to the system. On Linux and Windows
+the same work with ctrl, with F5 to rescan too.
 
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
 commits, `esc` goes back.

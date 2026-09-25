@@ -2944,12 +2944,17 @@ const MODIFIER_ZOOM: &str = if cfg!(target_os = "macos") {
 } else {
     "ctrl = / - / 0"
 };
+const MODIFIER_OPEN: &str = if cfg!(target_os = "macos") {
+    "\u{2318}O"
+} else {
+    "ctrl-o"
+};
 
 fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 26] = [
+    let rows: [(&str, &str); 27] = [
         ("space / x", "Mark or unmark the tile you point at"),
         (MODIFIER_CLICK, "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
@@ -2975,6 +2980,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("c", "Review the marked list"),
         ("t", "Size, files or age: what areas and colours say"),
         ("r", "Scan again from the same root"),
+        (MODIFIER_OPEN, "Choose another directory to scan"),
         ("g", "The whole disk; click any directory above to widen"),
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
@@ -2983,6 +2989,8 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
             "o",
             if cfg!(target_os = "macos") {
                 "Show it in Finder"
+            } else if cfg!(windows) {
+                "Show it in File Explorer"
             } else {
                 "Show it in the file manager"
             },
