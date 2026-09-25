@@ -49,6 +49,13 @@ impl SpaceInfo {
 }
 
 /// Read the space on the volume containing `path`.
+#[cfg(windows)]
+pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
+    crate::windows::space_info(path)
+}
+
+/// Read the space on the volume containing `path`.
+#[cfg(not(windows))]
 pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     let stat = rustix::fs::statvfs(path)?;
     // `f_frsize` is the fragment size the block counts are expressed in;
@@ -66,9 +73,17 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
     })
 }
 
+/// The volume a path is on, as Windows names it: `C:\`, a share, or the
+/// folder a volume is mounted on.
+#[cfg(windows)]
+pub fn device_for(path: &Path) -> Option<String> {
+    crate::windows::volume_root(path).map(|root| root.display().to_string())
+}
+
 /// The device a path's filesystem is mounted from, such as
 /// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
 /// `/proc/self/mounts`. `None` where that table cannot be read.
+#[cfg(not(windows))]
 pub fn device_for(path: &Path) -> Option<String> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -186,17 +201,40 @@ pub fn volume_root(mounts: &[Mount], path: &Path) -> Option<PathBuf> {
 }
 
 /// [`volume_root`] for this machine.
+#[cfg(not(windows))]
 pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     volume_root(&parse_mounts(&table), &path)
 }
 
+/// The top of the volume `path` lives on: its drive, such as `C:\`.
+#[cfg(windows)]
+pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
+    crate::windows::volume_root(path)
+}
+
 /// [`foreign_mounts`] for this machine; `None` when the mount table cannot
 /// be read, so the caller can fall back to comparing devices.
+#[cfg(not(windows))]
 pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     Some(foreign_mounts(&parse_mounts(&table), root))
+}
+
+/// Nothing to leave out by path on Windows.
+///
+/// There, the only way into another volume below `root` is a folder that
+/// volume is mounted on, which is a reparse point the walk treats as a link
+/// and does not enter unless links are followed; other drives are separate
+/// trees altogether.
+#[cfg(windows)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is the Unix answer when the mount table is missing"
+)]
+pub const fn foreign_mounts_for(_root: &Path) -> Option<Vec<PathBuf>> {
+    Some(Vec::new())
 }
 
 #[cfg(test)]

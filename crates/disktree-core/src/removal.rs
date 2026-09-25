@@ -10,8 +10,9 @@
 //!   standard library rather than by shelling out, so no path ever reaches a
 //!   shell and no filename can be misread as an option.
 //! * [`RemovalMode::Trash`] — move to the desktop trash, using `trash-put`,
-//!   then `gio trash`, then a built-in XDG implementation. The backend is
-//!   detected once and named in the UI so the user knows what actually happens.
+//!   then `gio trash`, then a built-in XDG implementation; on Windows, the
+//!   Recycle Bin. The backend is detected once and named in the UI so the
+//!   user knows what actually happens.
 
 use std::fs;
 use std::io;
@@ -21,6 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+
+#[cfg(windows)]
+use crate::windows::{same, within};
 
 /// One path the user asked to remove.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,7 +96,7 @@ impl Plan {
 /// looking at is the only thing they consented to act on.
 pub fn plan(targets: &[Target], root: &Path) -> Plan {
     let root = normalize(root);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = std::env::home_dir();
     let mut plan = Plan::default();
     let mut accepted: Vec<Target> = Vec::new();
 
@@ -118,7 +122,7 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
     for target in accepted {
         if outer
             .iter()
-            .any(|candidate| target.path.starts_with(&candidate.path))
+            .any(|candidate| within(&target.path, &candidate.path))
         {
             plan.covered.push(target);
         } else {
@@ -135,6 +139,7 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
 /// and removing them by hand breaks the system; pacman, paccache and
 /// `journalctl --vacuum` are the right tools. Refused even where
 /// permissions would allow it, and even inside them.
+#[cfg(not(windows))]
 const SYSTEM_TREES: [&str; 14] = [
     "/bin",
     "/boot",
@@ -152,8 +157,13 @@ const SYSTEM_TREES: [&str; 14] = [
     "/efi",
 ];
 
+/// What to use instead, said when a system tree is refused.
+#[cfg(not(windows))]
+const SYSTEM_TOOLS: &str = "use the package manager";
+
 /// The system tree `path` is in, if any. The home directory is never
 /// system, wherever it lives.
+#[cfg(not(windows))]
 fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
     if home.is_some_and(|home| path.starts_with(normalize(home))) {
         return None;
@@ -164,22 +174,83 @@ fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
         .copied()
 }
 
+/// [`SYSTEM_TREES`] on Windows: Windows itself, installed programs and
+/// their machine-wide data, and what Windows keeps at the top of its drive
+/// for restore points, recovery and booting. Taken from the environment, so
+/// a system elsewhere is still recognized, and the usual places on the
+/// system drive besides.
+#[cfg(windows)]
+fn system_trees() -> Vec<PathBuf> {
+    let drive = system_drive();
+    let mut trees: Vec<PathBuf> = [
+        "SystemRoot",
+        "ProgramFiles",
+        "ProgramFiles(x86)",
+        "ProgramW6432",
+        "ProgramData",
+    ]
+    .into_iter()
+    .filter_map(std::env::var_os)
+    .map(PathBuf::from)
+    // An empty or relative value would match too much or nothing at all.
+    .filter(|tree| tree.is_absolute())
+    .collect();
+    trees.extend(
+        [
+            "Windows",
+            "Program Files",
+            "Program Files (x86)",
+            "ProgramData",
+            "System Volume Information",
+            "Recovery",
+            "Boot",
+            "bootmgr",
+        ]
+        .map(|name| drive.join(name)),
+    );
+    trees
+}
+
+/// The root of the drive Windows runs from, such as `C:\`.
+#[cfg(windows)]
+fn system_drive() -> PathBuf {
+    let mut drive =
+        std::env::var_os("SystemDrive").unwrap_or_else(|| "C:".into());
+    // `C:` alone is the current directory on C:, not its root.
+    drive.push(r"\");
+    PathBuf::from(drive)
+}
+
+#[cfg(windows)]
+const SYSTEM_TOOLS: &str = "use Settings, or the program's own uninstaller";
+
+#[cfg(windows)]
+fn system_tree(path: &Path, home: Option<&Path>) -> Option<String> {
+    if home.is_some_and(|home| within(path, &normalize(home))) {
+        return None;
+    }
+    system_trees()
+        .into_iter()
+        .find(|tree| within(path, tree))
+        .map(|tree| tree.display().to_string())
+}
+
 fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
     if path.parent().is_none() {
         return Some("the filesystem root cannot be removed".into());
     }
-    if path == root {
+    if same(path, root) {
         return Some("the scanned root cannot be removed".into());
     }
-    if home.is_some_and(|home| path == normalize(home)) {
+    if home.is_some_and(|home| same(path, &normalize(home))) {
         return Some("the home directory cannot be removed".into());
     }
-    if !path.starts_with(root) {
+    if !within(path, root) {
         return Some("outside the scanned root".into());
     }
     if let Some(system) = system_tree(path, home) {
         return Some(format!(
-            "part of the system under {system}: use the package manager"
+            "part of the system under {system}: {SYSTEM_TOOLS}"
         ));
     }
     if is_mount_point(path) {
@@ -189,6 +260,17 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
         );
     }
     None
+}
+
+/// `path` is `base` or inside it, by whole components.
+#[cfg(not(windows))]
+fn within(path: &Path, base: &Path) -> bool {
+    path.starts_with(base)
+}
+
+#[cfg(not(windows))]
+fn same(left: &Path, right: &Path) -> bool {
+    left == right
 }
 
 /// Whether `path` sits on a different device than its parent, i.e. is a
@@ -212,7 +294,13 @@ pub fn is_mount_point(path: &Path) -> bool {
     }
 }
 
-#[cfg(not(unix))]
+/// Whether `path` is a folder another volume is mounted on.
+#[cfg(windows)]
+pub fn is_mount_point(path: &Path) -> bool {
+    crate::windows::is_mount_point(path)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn is_mount_point(_path: &Path) -> bool {
     false
 }
@@ -256,6 +344,8 @@ pub enum TrashBackend {
     Gio,
     /// The XDG trash directory, implemented here.
     XdgHome,
+    /// The Windows Recycle Bin, through the shell's own file operation.
+    RecycleBin,
     /// No way to move files to a trash on this machine.
     #[default]
     Unavailable,
@@ -264,7 +354,9 @@ pub enum TrashBackend {
 impl TrashBackend {
     pub const fn is_available(self) -> bool {
         match self {
-            Self::TrashPut | Self::Gio | Self::XdgHome => true,
+            Self::TrashPut | Self::Gio | Self::XdgHome | Self::RecycleBin => {
+                true
+            }
             Self::Unavailable => false,
         }
     }
@@ -274,6 +366,7 @@ impl TrashBackend {
             Self::TrashPut => "trash-put",
             Self::Gio => "gio trash",
             Self::XdgHome => "XDG trash",
+            Self::RecycleBin => "the Recycle Bin",
             Self::Unavailable => "no trash tool found",
         }
     }
@@ -287,6 +380,7 @@ impl TrashBackend {
             Self::XdgHome => {
                 "moves into ~/.local/share/Trash on the same volume"
             }
+            Self::RecycleBin => "the same Recycle Bin as File Explorer",
             Self::Unavailable => {
                 "install trash-cli or keep deleting permanently"
             }
@@ -294,7 +388,15 @@ impl TrashBackend {
     }
 }
 
+/// Detect the best available trash backend for this machine. Windows
+/// always has its Recycle Bin.
+#[cfg(windows)]
+pub const fn detect_trash_backend() -> TrashBackend {
+    TrashBackend::RecycleBin
+}
+
 /// Detect the best available trash backend for this machine.
+#[cfg(not(windows))]
 pub fn detect_trash_backend() -> TrashBackend {
     if which("trash-put") {
         TrashBackend::TrashPut
@@ -307,6 +409,7 @@ pub fn detect_trash_backend() -> TrashBackend {
     }
 }
 
+#[cfg(not(windows))]
 fn which(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -445,9 +548,25 @@ pub fn remove_permanently(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
         fs::remove_dir_all(path)
+    } else if is_dir_link(&meta) {
+        // Windows removes a link to a directory, a junction or a directory
+        // symlink, as a directory: `RemoveDirectoryW` takes the link and
+        // leaves its target alone.
+        fs::remove_dir(path)
     } else {
         fs::remove_file(path)
     }
+}
+
+#[cfg(windows)]
+fn is_dir_link(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::FileTypeExt as _;
+    meta.file_type().is_symlink_dir()
+}
+
+#[cfg(not(windows))]
+const fn is_dir_link(_meta: &fs::Metadata) -> bool {
+    false
 }
 
 /// Move one path to the desktop trash.
@@ -456,10 +575,24 @@ pub fn move_to_trash(path: &Path, backend: TrashBackend) -> io::Result<()> {
         TrashBackend::TrashPut => run_tool(Path::new("trash-put"), &[], path),
         TrashBackend::Gio => run_tool(Path::new("gio"), &["trash"], path),
         TrashBackend::XdgHome => trash_via_xdg(path),
+        TrashBackend::RecycleBin => recycle(path),
         TrashBackend::Unavailable => Err(io::Error::other(
             "no trash tool is installed; use permanent deletion instead",
         )),
     }
+}
+
+/// Hand `path` to the Recycle Bin. `trash` asks the shell to warn before it
+/// destroys anything rather than recycling it (`FOF_WANTNUKEWARNING`), so
+/// the reversible path cannot turn into a permanent one silently.
+#[cfg(windows)]
+fn recycle(path: &Path) -> io::Result<()> {
+    trash::delete(path).map_err(io::Error::other)
+}
+
+#[cfg(not(windows))]
+fn recycle(_path: &Path) -> io::Result<()> {
+    Err(io::Error::other("the Recycle Bin is only on Windows"))
 }
 
 /// Run one trash tool on one path.
@@ -547,6 +680,7 @@ pub fn trash_into(_path: &Path, _trash: &Path) -> io::Result<()> {
 }
 
 /// `name`, or `name.1`, `name.2`, … until the name is free in `dir`.
+#[cfg(unix)]
 fn unique_name(dir: &Path, name: &str) -> (PathBuf, String) {
     let first = dir.join(name);
     if !first.exists() {
@@ -579,6 +713,7 @@ pub fn percent_encode(input: &str) -> String {
     out
 }
 
+#[cfg(unix)]
 fn deletion_date() -> String {
     // The specification wants ISO 8601 in local time; chrono is already in the
     // dependency graph, so use it rather than approximating the offset.
@@ -631,7 +766,7 @@ mod tests {
     fn the_root_and_home_are_refused() {
         let temp = tree();
         let root = temp.path();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = std::env::home_dir();
         let mut targets = vec![target(Path::new("/"), 0), target(root, 0)];
         if let Some(home) = &home {
             targets.push(target(home, 0));
@@ -699,17 +834,52 @@ mod tests {
         assert!(temp.path().join("a/c.bin").exists());
     }
 
+    /// A link to a directory: a symbolic link on Unix, a junction on
+    /// Windows, which needs no privilege to make.
+    fn link_dir(target: &Path, link: &Path) {
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(target, link).expect("symlink");
+        #[cfg(windows)]
+        assert!(crate::windows::make_junction(link, target), "junction");
+    }
+
     #[test]
     fn permanent_removal_unlinks_a_symlink_instead_of_following_it() {
         let temp = tree();
         let keep = TempDir::new().expect("tempdir");
         fs::write(keep.path().join("precious.bin"), b"data").expect("write");
         let link = temp.path().join("link");
-        std::os::unix::fs::symlink(keep.path(), &link).expect("symlink");
+        link_dir(keep.path(), &link);
 
         remove_permanently(&link).expect("remove link");
-        assert!(!link.exists());
+        assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
         assert!(keep.path().join("precious.bin").exists());
+    }
+
+    /// Git keeps its objects read-only, which on Windows stops a plain
+    /// delete; clearing an old checkout must still work.
+    #[test]
+    fn read_only_files_are_removed_too() {
+        let temp = tree();
+        let objects = temp.path().join("a/b/objects");
+        fs::create_dir_all(&objects).expect("mkdir");
+        let object = objects.join("pack.idx");
+        fs::write(&object, b"x").expect("write");
+        let mut permissions =
+            fs::metadata(&object).expect("stat").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&object, permissions).expect("read-only");
+        let lone = temp.path().join("a/lone.idx");
+        fs::write(&lone, b"x").expect("write");
+        let mut permissions = fs::metadata(&lone).expect("stat").permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&lone, permissions).expect("read-only");
+
+        remove_permanently(&lone).expect("a read-only file");
+        remove_permanently(&temp.path().join("a/b")).expect("a directory");
+        assert!(!lone.exists());
+        assert!(!temp.path().join("a/b").exists());
+        assert!(temp.path().join("a/c.bin").exists());
     }
 
     #[test]
@@ -728,6 +898,7 @@ mod tests {
         assert_eq!(percent_encode("/a\nb"), "/a%0Ab");
     }
 
+    #[cfg(unix)]
     #[test]
     fn trash_names_avoid_collisions() {
         let temp = TempDir::new().expect("tempdir");
@@ -740,6 +911,7 @@ mod tests {
         assert_ne!(first, second);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_xdg_trash_moves_a_file_and_records_where_it_came_from() {
         // A private trash directory keeps the test out of the real trash can.
@@ -762,6 +934,7 @@ mod tests {
         assert!(info.contains("DeletionDate="));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_trash_info_path_is_restorable() {
         let trash = TempDir::new().expect("tempdir");
@@ -830,6 +1003,7 @@ mod tests {
         assert!(root.join("a/one.bin").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_trash_tool_is_called_with_the_path_after_a_separator() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -858,6 +1032,7 @@ mod tests {
         assert!(doomed.exists(), "the real tool would have moved it");
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_failing_trash_tool_reports_its_stderr() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -872,6 +1047,7 @@ mod tests {
         assert!(error.to_string().contains("no trash here"), "{error}");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn detection_prefers_a_tool_this_machine_has() {
         let backend = detect_trash_backend();
@@ -881,6 +1057,45 @@ mod tests {
         assert!(backend.is_available());
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_trashes_into_the_recycle_bin() {
+        let backend = detect_trash_backend();
+        assert_eq!(backend, TrashBackend::RecycleBin);
+        assert!(backend.is_available());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_trees_are_refused_in_a_whole_disk_scan() {
+        let drive = system_drive();
+        let home = drive.join(r"Users\tobi");
+        let system = |relative: &str| {
+            system_tree(&drive.join(relative), Some(&home))
+                .map(|tree| tree.to_lowercase())
+        };
+        let windows = drive.join("Windows").display().to_string();
+        assert!(
+            system(r"WINDOWS\System32\drivers\etc\hosts").is_some(),
+            "without regard to case"
+        );
+        assert!(system(r"Program Files\App\app.exe").is_some());
+        assert!(system(r"Program Files (x86)\App").is_some());
+        assert!(system(r"ProgramData\Vendor\state.db").is_some());
+        assert!(system("System Volume Information").is_some());
+        assert_eq!(system("Windows.old"), None, "components, not prefixes");
+        assert_eq!(system(r"Users\tobi\AppData\Local\Temp"), None);
+        assert_eq!(system("Games"), None);
+        let reason = refuse(&drive.join(r"Windows\Temp"), &drive, Some(&home));
+        assert!(
+            reason.is_some_and(|reason| reason
+                .to_lowercase()
+                .contains(&windows.to_lowercase())),
+            "refused as part of {windows}"
+        );
+    }
+
+    #[cfg(not(windows))]
     #[test]
     fn system_trees_are_refused_in_a_whole_disk_scan() {
         let home = Path::new("/home/tobi");
