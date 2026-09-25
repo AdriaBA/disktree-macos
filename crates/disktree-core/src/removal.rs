@@ -76,6 +76,8 @@ pub struct Plan {
     pub covered: Vec<Target>,
     /// Marked paths that must not be touched.
     pub blocked: Vec<Blocked>,
+    /// The scanned root the targets were judged against.
+    pub root: PathBuf,
 }
 
 impl Plan {
@@ -94,7 +96,10 @@ impl Plan {
 /// looking at is the only thing they consented to act on.
 pub fn plan(targets: &[Target], root: &Path) -> Plan {
     let root = normalize(root);
-    let mut plan = Plan::default();
+    let mut plan = Plan {
+        root: root.clone(),
+        ..Plan::default()
+    };
     let mut accepted: Vec<Target> = Vec::new();
 
     if targets.is_empty() {
@@ -103,10 +108,15 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
     let mounts = mount_points();
     // Once per plan, not per target: the review screen plans every frame.
     let home = std::env::home_dir().map(|home| Home::of(&home));
+    let real_root = fs::canonicalize(&root).ok();
 
     for target in targets {
         let path = normalize(&target.path);
-        if let Some(reason) = refuse(&path, &root, home.as_ref(), &mounts) {
+        let reason =
+            refuse(&path, &root, home.as_ref(), &mounts).or_else(|| {
+                linked(&path, &root, real_root.as_deref(), home.as_ref())
+            });
+        if let Some(reason) = reason {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
                 reason,
@@ -320,6 +330,10 @@ fn system_tree_below(key: &Path) -> Option<&'static str> {
 #[derive(Debug)]
 struct Home {
     key: PathBuf,
+    /// The key of the path with every link resolved: `/home` may be a link
+    /// to `/data/home`, and a scan of `/data` then shows home under a
+    /// spelling [`Self::key`] does not match.
+    real: Option<PathBuf>,
     /// Device and inode (volume and file id on Windows), so a spelling
     /// [`guard_key`] cannot fold still matches.
     id: Option<(u64, u64)>,
@@ -329,6 +343,7 @@ impl Home {
     fn of(path: &Path) -> Self {
         Self {
             key: guard_key(path),
+            real: fs::canonicalize(path).ok().map(|real| guard_key(&real)),
             id: identity(path, true),
         }
     }
@@ -348,6 +363,19 @@ fn refuse(
     }
     if key == root_key {
         return Some("the scanned root cannot be removed".into());
+    }
+    if cfg!(windows)
+        && let Some(name) = path.components().find_map(|part| match part {
+            Component::Normal(name) => {
+                misread_by_win32(&name.to_string_lossy()).then_some(name)
+            }
+            _ => None,
+        })
+    {
+        return Some(format!(
+            "Windows would read {} as a different name, and remove that",
+            name.display()
+        ));
     }
     if home_key.is_some_and(|home| key == home)
         || home
@@ -387,6 +415,67 @@ fn refuse(
              filesystem",
             mount.display()
         ));
+    }
+    None
+}
+
+/// A name Win32 reads as some other one. It strips trailing dots and
+/// spaces, so `C:\Users.` opens `C:\Users`; it reads `NUL` or `COM1` in
+/// any directory as a device; and after a colon comes a stream of another
+/// file. NTFS keeps such names when they arrive through `\\?\` or WSL,
+/// and the scan lists them as stored, but the trash and the removal open
+/// them through Win32.
+fn misread_by_win32(name: &str) -> bool {
+    const DEVICES: [&str; 4] = ["con", "prn", "aux", "nul"];
+    if name.ends_with(['.', ' ']) || name.contains(':') {
+        return true;
+    }
+    // `nul.txt` was a device too, before Windows 11: refused either way.
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or(name)
+        .trim_end()
+        .to_lowercase();
+    let numbered = ["com", "lpt"].iter().any(|device| {
+        stem.strip_prefix(device).is_some_and(|number| {
+            matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8")
+                || matches!(number, "9" | "\u{b9}" | "\u{b2}" | "\u{b3}")
+        })
+    });
+    numbered || DEVICES.contains(&stem.as_str())
+}
+
+/// Why `path`, inside `root` as spelled, is somewhere else in fact, if it
+/// is. The guards compare spellings, and a link or junction on the way
+/// down makes a spelling inside the root name something outside it: the
+/// trash, and removal on Windows, follow it. Links above the root are the
+/// user's own choice of root, so the real path is compared with the real
+/// root. The home directory is looked for again by real path, too.
+///
+/// Anything that cannot be resolved passes: the removal of a path that is
+/// gone fails on its own.
+fn linked(
+    path: &Path,
+    root: &Path,
+    real_root: Option<&Path>,
+    home: Option<&Home>,
+) -> Option<String> {
+    let (parent, name) = (path.parent()?, path.file_name()?);
+    let real = guard_key(&fs::canonicalize(parent).ok()?.join(name));
+    if let (Some(real_root), Ok(rest)) = (real_root, path.strip_prefix(root))
+        && real != guard_key(&real_root.join(rest))
+    {
+        return Some(format!(
+            "reached through a link: it is really {}",
+            real.display()
+        ));
+    }
+    if home
+        .and_then(|home| home.real.as_ref())
+        .is_some_and(|home| home.starts_with(&real))
+    {
+        return Some("it contains the home directory".into());
     }
     None
 }
@@ -775,12 +864,25 @@ fn run(
     // or, right after start, not read yet. Judged again against a fresh
     // read, here on the worker, before anything is touched.
     let mounts = read_mount_points();
+    // Links too: one put on the way down since the plan was made would lead
+    // the trash out of the root. Permanent removal on Unix refuses that by
+    // itself; see [`open_parent`].
+    let home = std::env::home_dir().map(|home| Home::of(&home));
+    let real_root = fs::canonicalize(&plan.root).ok();
 
     for target in &plan.targets {
         if cancel.load(Ordering::Relaxed) {
             break;
         }
-        let outcome = if let Some(reason) = mounted(&target.path, &mounts) {
+        let reason = mounted(&target.path, &mounts).or_else(|| {
+            linked(
+                &target.path,
+                &plan.root,
+                real_root.as_deref(),
+                home.as_ref(),
+            )
+        });
+        let outcome = if let Some(reason) = reason {
             Err(io::Error::other(reason))
         } else {
             match mode {
@@ -1627,6 +1729,98 @@ mod tests {
         let error = remove_permanently(&marked).expect_err("refused");
         assert!(error.to_string().contains("changed since"), "{error}");
         assert!(keep.path().join("x/precious.bin").exists());
+    }
+
+    #[test]
+    fn a_target_reached_through_a_link_is_refused() {
+        let temp = tree();
+        let keep = TempDir::new().expect("tempdir");
+        fs::write(keep.path().join("precious.bin"), b"data").expect("write");
+        link_dir(keep.path(), &temp.path().join("link"));
+
+        let plan = plan(
+            &[target(&temp.path().join("link/precious.bin"), 4)],
+            temp.path(),
+        );
+        assert!(plan.is_empty());
+        assert!(
+            plan.blocked[0].reason.contains("through a link"),
+            "{}",
+            plan.blocked[0].reason
+        );
+    }
+
+    /// The trash follows links on the way down, so the worker asks again,
+    /// whatever the mode.
+    #[test]
+    fn a_link_put_on_the_way_down_after_planning_stops_the_worker() {
+        let temp = tree();
+        let keep = TempDir::new().expect("tempdir");
+        fs::create_dir(keep.path().join("x")).expect("mkdir");
+        fs::write(keep.path().join("x/precious.bin"), b"data").expect("write");
+        fs::create_dir(temp.path().join("a/b/x")).expect("mkdir");
+        let plan = plan(&[target(&temp.path().join("a/b/x"), 0)], temp.path());
+        assert_eq!(plan.targets.len(), 1);
+        fs::remove_dir_all(temp.path().join("a/b")).expect("clear");
+        link_dir(keep.path(), &temp.path().join("a/b"));
+
+        let handle = spawn(plan, RemovalMode::Permanent);
+        let mut outcome = None;
+        for _ in 0..2000 {
+            while let Some(event) = handle.poll() {
+                if let RemovalEvent::Item { outcome: item, .. } = event {
+                    outcome = Some(item);
+                }
+            }
+            if outcome.is_some() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let error = outcome.expect("an item").expect_err("refused");
+        assert!(error.contains("through a link"), "{error}");
+        assert!(keep.path().join("x/precious.bin").exists());
+    }
+
+    #[test]
+    fn home_is_found_by_its_real_path_too() {
+        let temp = tree();
+        let real = temp.path().join("data");
+        fs::create_dir_all(real.join("home/user")).expect("mkdir");
+        let spelled = TempDir::new().expect("tempdir");
+        link_dir(&real.join("home"), &spelled.path().join("home"));
+        let home = Home::of(&spelled.path().join("home/user"));
+        let root = fs::canonicalize(temp.path()).expect("real root");
+
+        let reason =
+            linked(&root.join("data"), &root, Some(&root), Some(&home))
+                .expect("refused");
+        assert!(reason.contains("home directory"), "{reason}");
+        assert_eq!(
+            linked(&root.join("other"), &root, Some(&root), Some(&home)),
+            None
+        );
+    }
+
+    #[test]
+    fn names_win32_would_misread_are_recognized() {
+        for name in [
+            "Users.",
+            "Users ",
+            "a. .",
+            "NUL",
+            "nul.txt",
+            "Com1",
+            "LPT9.log",
+            "con ",
+            "file:stream",
+            "COM\u{b9}",
+        ] {
+            assert!(misread_by_win32(name), "{name:?}");
+        }
+        for name in ["Users", ".git", "..hidden", "console", "COM0", "LPT10"] {
+            assert!(!misread_by_win32(name), "{name:?}");
+        }
     }
 
     #[test]
