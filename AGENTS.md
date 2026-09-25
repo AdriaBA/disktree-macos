@@ -1,7 +1,9 @@
 # disktree — agent guide
 
-A GPUI + gpui-omarchy treemap explorer for disk usage on Omarchy. Read
-`README.md` for the product; this file is the working contract.
+A GPUI + gpui-omarchy treemap explorer for disk usage on Omarchy. This fork's
+`README.md` is the macOS distribution page; the complete cross-platform product
+documentation remains in the [upstream README](https://github.com/tobi/disktree).
+This file is the working contract.
 
 ## What this is
 
