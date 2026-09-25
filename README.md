@@ -275,7 +275,8 @@ The same program, with Windows' answers to the questions above:
   before destroying anything it cannot recycle.
 - **Refused besides the rules below:** Windows, Program Files and
   ProgramData, what Windows keeps at the top of its drive (System Volume
-  Information, Recovery, Boot), and any folder holding your profile, such as
+  Information, Recovery, Boot, and the page and hibernation files, which
+  Settings turns off), and any folder holding your profile, such as
   `C:\Users`. Names compare without regard to case, as Windows compares
   them.
 - **Hidden** means a name starting with a dot, or the hidden attribute, so
@@ -298,7 +299,8 @@ tested:
 - a directory holding your home directory or a system tree is refused (on
   macOS `/Users` is on the same volume as `/`, and `/opt` holds
   `/opt/homebrew`);
-- system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, …) are
+- system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`,
+  `/gnu/store`, Homebrew's prefix on macOS and Linux, …) are
   refused even where permissions would allow it: packages own them, and
   pacman, paccache or `journalctl --vacuum` are the tools;
 - a symlink is unlinked, never followed;

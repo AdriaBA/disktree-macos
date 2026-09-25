@@ -160,14 +160,17 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
 /// an app to the Trash is how macOS uninstalls it, and the apps macOS ships
 /// live on the read-only system volume anyway.
 #[cfg(not(windows))]
-const SYSTEM_TREES: [&str; 20] = [
+const SYSTEM_TREES: [&str; 24] = [
     "/bin",
     "/boot",
     "/dev",
     "/etc",
     "/lib",
     "/lib64",
+    "/lib32",
+    "/libx32",
     "/nix/store",
+    "/gnu/store",
     "/proc",
     "/run",
     "/sbin",
@@ -175,6 +178,8 @@ const SYSTEM_TREES: [&str; 20] = [
     "/usr",
     "/var/lib",
     "/efi",
+    // Homebrew on Linux, where it lives outside every user's home.
+    "/home/linuxbrew/.linuxbrew",
     // macOS.
     "/System",
     "/Library",
@@ -282,6 +287,11 @@ fn system_trees() -> Vec<PathBuf> {
             "Recovery",
             "Boot",
             "bootmgr",
+            // Windows' memory: turned off in Settings (`powercfg /h off` for
+            // hibernation), never deleted by hand.
+            "pagefile.sys",
+            "hiberfil.sys",
+            "swapfile.sys",
         ]
         .map(|name| drive.join(name)),
     );
@@ -2126,6 +2136,8 @@ mod tests {
         assert!(system(r"Program Files (x86)\App").is_some());
         assert!(system(r"ProgramData\Vendor\state.db").is_some());
         assert!(system("System Volume Information").is_some());
+        assert!(system("pagefile.sys").is_some());
+        assert!(system("HIBERFIL.SYS").is_some());
         assert_eq!(system("Windows.old"), None, "components, not prefixes");
         assert_eq!(system(r"Users\tobi\AppData\Local\Temp"), None);
         assert_eq!(system("Games"), None);
@@ -2198,6 +2210,14 @@ mod tests {
         );
         assert_eq!(tree_of(Path::new("/var/cache/pacman/pkg"), home), None);
         assert_eq!(tree_of(Path::new("/opt/thing"), home), None);
+        assert_eq!(
+            tree_of(Path::new("/home/linuxbrew/.linuxbrew/Cellar"), home),
+            Some("/home/linuxbrew/.linuxbrew")
+        );
+        assert_eq!(
+            tree_of(Path::new("/gnu/store/abc-hello"), home),
+            Some("/gnu/store")
+        );
         assert_eq!(
             tree_of(Path::new("/usrlocal"), home),
             None,
