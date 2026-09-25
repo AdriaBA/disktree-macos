@@ -6,8 +6,8 @@
 //!
 //! Two mechanisms are offered:
 //!
-//! * [`RemovalMode::Permanent`] — `rm -rf` semantics, implemented with the
-//!   standard library rather than by shelling out, so no path ever reaches a
+//! * [`RemovalMode::Permanent`] — `rm -rf --one-file-system` semantics,
+//!   implemented here rather than by shelling out, so no path ever reaches a
 //!   shell and no filename can be misread as an option.
 //! * [`RemovalMode::Trash`] — move to the desktop trash, using `trash-put`,
 //!   then `gio trash`, then a built-in XDG implementation. The backend is
@@ -95,10 +95,14 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut plan = Plan::default();
     let mut accepted: Vec<Target> = Vec::new();
+    if targets.is_empty() {
+        return plan;
+    }
+    let mounts = mount_points();
 
     for target in targets {
         let path = normalize(&target.path);
-        if let Some(reason) = refuse(&path, &root, home.as_deref()) {
+        if let Some(reason) = refuse(&path, &root, home.as_deref(), &mounts) {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
                 reason,
@@ -164,7 +168,12 @@ fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
         .copied()
 }
 
-fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
+fn refuse(
+    path: &Path,
+    root: &Path,
+    home: Option<&Path>,
+    mounts: &[PathBuf],
+) -> Option<String> {
     if path.parent().is_none() {
         return Some("the filesystem root cannot be removed".into());
     }
@@ -188,7 +197,37 @@ fn refuse(path: &Path, root: &Path, home: Option<&Path>) -> Option<String> {
                 .into(),
         );
     }
+    if let Some(mount) = mount_below(path, mounts) {
+        return Some(format!(
+            "{} is mounted inside it: removing it would reach into another \
+             filesystem",
+            mount.display()
+        ));
+    }
     None
+}
+
+/// Every mount point on this machine, from the mount table. Empty where the
+/// table cannot be read; the removal walker still stops at a device boundary.
+fn mount_points() -> Vec<PathBuf> {
+    std::fs::read_to_string("/proc/self/mounts")
+        .map(|table| {
+            crate::space::parse_mounts(&table)
+                .into_iter()
+                .map(|mount| mount.point)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A mount point strictly inside `path`, if there is one. A scan that stays
+/// on one filesystem never shows what is mounted there, so the user cannot
+/// have meant to remove it.
+fn mount_below<'a>(path: &Path, mounts: &'a [PathBuf]) -> Option<&'a Path> {
+    mounts
+        .iter()
+        .find(|mount| mount.as_path() != path && mount.starts_with(path))
+        .map(PathBuf::as_path)
 }
 
 /// Whether `path` sits on a different device than its parent, i.e. is a
@@ -440,7 +479,26 @@ fn run(
     });
 }
 
-/// `rm -rf` semantics: a symlink is unlinked, never followed.
+/// `rm -rf --one-file-system` semantics: a symlink is unlinked, never
+/// followed, and nothing on another filesystem is touched.
+///
+/// `fs::remove_dir_all` would descend into anything mounted inside `path` and
+/// empty it before failing on the mount point itself, so the walk is done here
+/// instead: every directory is opened relative to its parent with
+/// `O_NOFOLLOW`, and one on a different device or mount stops the removal.
+#[cfg(unix)]
+pub fn remove_permanently(path: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() {
+        return fs::remove_file(path);
+    }
+    let dir = open_dir(rustix::fs::CWD, path)?;
+    let top = Volume::of(&dir)?;
+    remove_contents(&dir, &top, path)?;
+    fs::remove_dir(path)
+}
+
+#[cfg(not(unix))]
 pub fn remove_permanently(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
@@ -448,6 +506,111 @@ pub fn remove_permanently(path: &Path) -> io::Result<()> {
     } else {
         fs::remove_file(path)
     }
+}
+
+/// Where a directory lives, as far as crossing into another filesystem goes.
+#[cfg(unix)]
+struct Volume {
+    device: rustix::fs::Stat,
+    /// The mount the directory belongs to, where the kernel reports it. A bind
+    /// mount of the same filesystem keeps its `st_dev`, so the device alone
+    /// cannot see it.
+    mount: Option<u64>,
+}
+
+#[cfg(unix)]
+impl Volume {
+    fn of(dir: &std::os::fd::OwnedFd) -> io::Result<Self> {
+        Ok(Self {
+            device: rustix::fs::fstat(dir)?,
+            mount: mount_id(dir),
+        })
+    }
+
+    fn contains(&self, other: &Self) -> bool {
+        self.device.st_dev == other.device.st_dev && self.mount == other.mount
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn mount_id(dir: &std::os::fd::OwnedFd) -> Option<u64> {
+    use rustix::fs::{AtFlags, StatxFlags, statx};
+    statx(dir, c"", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)
+        .ok()
+        .filter(|stat| stat.stx_mask & StatxFlags::MNT_ID.bits() != 0)
+        .map(|stat| stat.stx_mnt_id)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+const fn mount_id(_dir: &std::os::fd::OwnedFd) -> Option<u64> {
+    None
+}
+
+#[cfg(unix)]
+fn open_dir<P: rustix::path::Arg>(
+    parent: impl std::os::fd::AsFd,
+    name: P,
+) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, openat};
+    openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+}
+
+/// Empty the directory open at `dir`, staying on the volume of `top`.
+#[cfg(unix)]
+fn remove_contents(
+    dir: &std::os::fd::OwnedFd,
+    top: &Volume,
+    path: &Path,
+) -> io::Result<()> {
+    use rustix::fs::{AtFlags, Dir, FileType, unlinkat};
+    use rustix::io::Errno;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt as _;
+
+    // Names first, then removal: unlinking while a directory stream is open
+    // on the same directory may skip entries.
+    let mut entries = Vec::new();
+    for entry in Dir::read_from(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name != c"." && name != c".." {
+            entries.push((name.to_owned(), entry.file_type()));
+        }
+    }
+
+    for (name, kind) in entries {
+        let child_path = path.join(OsStr::from_bytes(name.to_bytes()));
+        if !matches!(kind, FileType::Directory | FileType::Unknown) {
+            unlinkat(dir, &name, AtFlags::empty())?;
+            continue;
+        }
+        let child = match open_dir(dir, &name) {
+            Ok(child) => child,
+            // Not a directory after all: a symlink, or a file on a
+            // filesystem that does not report types.
+            Err(Errno::NOTDIR | Errno::LOOP) => {
+                unlinkat(dir, &name, AtFlags::empty())?;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if !top.contains(&Volume::of(&child)?) {
+            return Err(io::Error::other(format!(
+                "stopped at {}: another filesystem is mounted there, and \
+                 nothing on it was touched",
+                child_path.display()
+            )));
+        }
+        remove_contents(&child, top, &child_path)?;
+        drop(child);
+        unlinkat(dir, &name, AtFlags::REMOVEDIR)?;
+    }
+    Ok(())
 }
 
 /// Move one path to the desktop trash.
@@ -691,6 +854,52 @@ mod tests {
     }
 
     #[test]
+    fn a_target_with_a_mount_inside_is_refused() {
+        let temp = tree();
+        let root = temp.path();
+        let mounts = vec![root.join("a/b"), root.join("other")];
+        assert_eq!(
+            mount_below(&root.join("a"), &mounts),
+            Some(root.join("a/b").as_path())
+        );
+        assert_eq!(mount_below(&root.join("a/b"), &mounts), None, "itself");
+        assert_eq!(mount_below(&root.join("a/one.bin"), &mounts), None);
+        let reason =
+            refuse(&root.join("a"), root, None, &mounts).expect("refused");
+        assert!(reason.contains("mounted inside"), "{reason}");
+        assert_eq!(refuse(&root.join("a/one.bin"), root, None, &mounts), None);
+    }
+
+    #[test]
+    fn a_home_scan_has_nothing_mounted_below_a_temp_dir() {
+        let temp = tree();
+        assert_eq!(mount_below(temp.path(), &mount_points()), None);
+    }
+
+    #[test]
+    fn permanent_removal_takes_nested_trees_and_hidden_files() {
+        let temp = tree();
+        let doomed = temp.path().join("a");
+        fs::create_dir_all(doomed.join("b/c/d")).expect("mkdir");
+        fs::write(doomed.join("b/c/d/.hidden"), "x").expect("write");
+        fs::write(doomed.join("b/c/f"), "x").expect("write");
+        remove_permanently(&doomed).expect("remove tree");
+        assert!(!doomed.exists());
+        assert!(temp.path().join("other").exists());
+    }
+
+    #[test]
+    fn permanent_removal_unlinks_nested_symlinks_without_following_them() {
+        let temp = tree();
+        let outside = TempDir::new().expect("tempdir");
+        fs::write(outside.path().join("keep"), "x").expect("write");
+        std::os::unix::fs::symlink(outside.path(), temp.path().join("a/link"))
+            .expect("symlink");
+        remove_permanently(&temp.path().join("a")).expect("remove tree");
+        assert!(outside.path().join("keep").exists());
+    }
+
+    #[test]
     fn permanent_removal_takes_directories_and_leaves_siblings() {
         let temp = tree();
         let doomed = temp.path().join("a/b");
@@ -908,7 +1117,7 @@ mod tests {
             None
         );
         let reason =
-            refuse(Path::new("/etc/hosts"), Path::new("/"), Some(home));
+            refuse(Path::new("/etc/hosts"), Path::new("/"), Some(home), &[]);
         assert!(reason.is_some_and(|reason| reason.contains("/etc")));
     }
 }

@@ -76,6 +76,18 @@ fn run(path: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(path)
+        // A checkout's own config can name programs for git to run: an
+        // fsmonitor on every `status`, hooks, a pager. Selecting a directory
+        // in a disk viewer must not execute anything it contains, and a
+        // command-line `-c` outranks the repository's config.
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "-c",
+            "core.pager=cat",
+        ])
         .args(args)
         // Never prompt, never page, never take a lock for the index refresh.
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -133,5 +145,37 @@ mod tests {
         let state = state(dir.path()).expect("a checkout");
         assert_eq!(state.changed, 1, "one untracked file");
         assert_eq!(state.stashes, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_checkout_cannot_make_git_run_its_programs() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("ran");
+        let hook = dir.path().join("hook.sh");
+        std::fs::write(
+            &hook,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .expect("write hook");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod");
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(args)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        if !git(&["init", "-q"]) {
+            return; // no git on this machine
+        }
+        let hook = hook.to_string_lossy();
+        assert!(git(&["config", "core.fsmonitor", &hook]));
+        assert!(state(dir.path()).is_some());
+        assert!(!marker.exists(), "the checkout's fsmonitor ran");
     }
 }
