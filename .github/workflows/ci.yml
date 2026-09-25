@@ -98,3 +98,39 @@ jobs:
 
       - name: Test
         run: cargo xtask test
+
+  # The other half of each release: the same tests on the architectures
+  # the release builds for but the jobs above do not run on.
+  other-architectures:
+    name: Test (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux aarch64, runner: ubuntu-24.04-arm }
+          - { name: macOS x86_64, runner: macos-15-intel }
+          - { name: Windows aarch64, runner: windows-11-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+
+      - name: System libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-xcb-dev libxcb1-dev libfontconfig-dev libfreetype-dev \
+            libvulkan-dev libasound2-dev libssl-dev libzstd-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo xtask test
