@@ -278,8 +278,8 @@ The same program, with Windows' answers to the questions above:
   Information, Recovery, Boot), and any folder holding your profile, such as
   `C:\Users`. Names compare without regard to case, as Windows compares
   them.
-- **Hidden** still means a name starting with a dot; the hidden attribute is
-  not consulted, so `-H` does not drop `AppData`.
+- **Hidden** means a name starting with a dot, or the hidden attribute, so
+  `-H` drops `AppData` as Explorer hides it.
 - **The theme** follows Windows' light or dark setting, since there is no
   Omarchy theme to follow. It does on macOS too, and on GNOME and KDE.
 

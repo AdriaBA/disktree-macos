@@ -30,13 +30,13 @@ use windows_sys::Win32::Foundation::{
     ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, INVALID_HANDLE_VALUE,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-    FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY,
-    FILE_READ_ATTRIBUTES, FileIdExtdDirectoryInfo, FindFirstVolumeW,
-    FindNextVolumeW, FindVolumeClose, GetDiskFreeSpaceExW,
-    GetFileInformationByHandleEx, GetVolumePathNameW,
-    GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
+    FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
+    FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS, FILE_ATTRIBUTE_RECALL_ON_OPEN,
+    FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_ID_EXTD_DIR_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+    FileIdExtdDirectoryInfo, FindFirstVolumeW, FindNextVolumeW,
+    FindVolumeClose, GetDiskFreeSpaceExW, GetFileInformationByHandleEx,
+    GetVolumePathNameW, GetVolumePathNamesForVolumeNameW, SYNCHRONIZE,
 };
 
 use crate::space::SpaceInfo;
@@ -114,6 +114,12 @@ impl Entry {
     /// Last write, in Unix seconds; `0` when earlier or unknown.
     pub const fn modified(&self) -> i64 {
         self.modified
+    }
+
+    /// Whether Explorer hides this: `FILE_ATTRIBUTE_HIDDEN`, as on
+    /// `AppData` and `$Recycle.Bin`.
+    pub const fn hidden(&self) -> bool {
+        self.attributes & FILE_ATTRIBUTE_HIDDEN != 0
     }
 
     /// Whether this is a directory the cloud files provider holds and the
