@@ -122,9 +122,15 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | ".espressif" | ".arduino15" | ".config" | ".vscode" | ".zig"
         | ".rye" | ".conda" | "anaconda3" | "miniconda3" | ".opam"
         | ".ghcup" | ".stack" | ".julia" | ".dotnet" | ".android"
-        | ".sdkman" | ".volta" | ".yarn" | ".java" => Category::Toolchain,
+        | ".sdkman" | ".volta" | ".yarn" | ".java"
+        // macOS: Xcode's and the simulators' state in ~/Library/Developer.
+        // Not `Developer` itself: ~/Developer is where Apple puts projects.
+        | "xcode" | "coresimulator" => Category::Toolchain,
         "sync" | "dropbox" | "nextcloud" | "google drive" | "onedrive"
-        | "pclouddrive" | "mega" | ".stversions" => Category::Synced,
+        | "pclouddrive" | "mega" | ".stversions"
+        // macOS: iCloud Drive, and the File Provider clients (Dropbox,
+        // Google Drive, OneDrive) since macOS 12.
+        | "mobile documents" | "cloudstorage" => Category::Synced,
         ".git" => Category::Git,
         "pictures" | "photos" | "music" | "videos" | "movies" | "steam"
         | "models" | ".ollama" | ".lmstudio" | "games" | "wineprefix" => {
@@ -134,7 +140,8 @@ pub fn category_of_name(name: &str) -> Option<Category> {
         | "obsidian" | "public" | "templates" => Category::Documents,
         ".cache" | "cache" | "caches" | ".ccache" | ".sccache" | "_cacache"
         | "__pycache__" | "node_modules" | "trash" | ".trash" | "tmp"
-        | ".tmp" => Category::Cache,
+        | ".tmp" | "deriveddata" | "ios devicesupport"
+        | "watchos devicesupport" => Category::Cache,
         _ => return None,
     };
     Some(category)
@@ -155,7 +162,14 @@ pub fn reclaim_of(
         ".stversions" => Reclaim::SyncHistory,
         ".pnpm-store" | "pnpm" => Reclaim::PackageStore,
         "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
-        | ".next" | ".turbo" | ".parcel-cache" => Reclaim::BuildOutput,
+        | ".next" | ".turbo" | ".parcel-cache"
+        // Xcode's build products and indexes, rebuilt on the next build.
+        | "deriveddata" => Reclaim::BuildOutput,
+        // Symbols Xcode copies off a device it meets, and copies again the
+        // next time that device is plugged in.
+        "ios devicesupport" | "watchos devicesupport" => Reclaim::Regenerable,
+        // ~/Library/Logs, told apart from a project's logs by its neighbour.
+        "logs" if has_sibling("Application Support") => Reclaim::Temporary,
         // Too common to trust alone: only a build directory beside a manifest.
         "target" if has_sibling("Cargo.toml") => Reclaim::BuildOutput,
         "node_modules" if has_sibling("package.json") => Reclaim::Reinstallable,
@@ -423,6 +437,36 @@ mod tests {
             reclaim_of("snapshots", Category::Documents, |_| false),
             None
         );
+    }
+
+    #[test]
+    fn macos_developer_leftovers_are_reclaimable_and_its_risks_are_not() {
+        let none = |_: &str| false;
+        assert_eq!(
+            reclaim_of("DerivedData", Category::Toolchain, none),
+            Some(Reclaim::BuildOutput)
+        );
+        assert_eq!(
+            reclaim_of("iOS DeviceSupport", Category::Toolchain, none),
+            Some(Reclaim::Regenerable)
+        );
+        let library = |name: &str| name == "Application Support";
+        assert_eq!(
+            reclaim_of("Logs", Category::Other, library),
+            Some(Reclaim::Temporary)
+        );
+        assert_eq!(reclaim_of("logs", Category::Code, none), None);
+        // Big, but not safe to offer: Archives hold the symbols crash
+        // reports need, and Backup is an iPhone's only backup.
+        assert_eq!(reclaim_of("Archives", Category::Toolchain, none), None);
+        assert_eq!(reclaim_of("Backup", Category::Other, none), None);
+        assert_eq!(
+            category_of_name("Mobile Documents"),
+            Some(Category::Synced)
+        );
+        // ~/Developer holds a user's projects, not a toolchain.
+        assert_eq!(category_of_name("Developer"), None);
+        assert_eq!(category_of_name("Xcode"), Some(Category::Toolchain));
     }
 
     #[test]
