@@ -390,7 +390,9 @@ fn refuse(
     if home_key.is_some_and(|home| home.starts_with(&key)) {
         return Some("it contains the home directory".into());
     }
-    if !key.starts_with(&root_key) {
+    // By spelling too: the Data volume's root keeps its name as a key, while
+    // everything under it is keyed as under `/`.
+    if !key.starts_with(&root_key) && !path.starts_with(root) {
         return Some("outside the scanned root".into());
     }
     if let Some(system) = system_tree(&key, home_key) {
