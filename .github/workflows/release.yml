@@ -23,6 +23,9 @@ jobs:
     # The oldest supported runner: its glibc is what the binary needs at
     # least, so building here runs on the most systems.
     runs-on: ubuntu-22.04
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -86,3 +89,53 @@ jobs:
             gh release create "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" \
               --title "disktree ${TAG#v}" --generate-notes
           fi
+
+  windows:
+    name: Build and publish (Windows)
+    # After the Linux job, which checks the tag and creates the release.
+    needs: release
+    runs-on: windows-2025
+    env:
+      # The C runtime linked in, so disktree.exe also runs where the Visual
+      # C++ runtime was never installed. For the tests too, so both steps
+      # share one build.
+      RUSTFLAGS: -C target-feature=+crt-static
+    steps:
+      - run: git config --global core.autocrlf false
+
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.97"
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo xtask test
+
+      - name: Build
+        run: cargo build --release --locked -p disktree-app
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $name = "disktree-${{ needs.release.outputs.version }}-x86_64-windows"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item target/release/disktree.exe, README.md, LICENSE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          $hash = (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower()
+          # The format `sha256sum -c` reads, with a Unix line ending.
+          [IO.File]::WriteAllText("dist/$name.zip.sha256", "$hash  $name.zip`n")
+          "archive=dist/$name.zip" >> $env:GITHUB_OUTPUT
+
+      - name: Publish
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.release.outputs.tag }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: gh release upload "$TAG" "$ARCHIVE" "$ARCHIVE.sha256" --clobber
