@@ -35,6 +35,10 @@ mod menu_actions {
             OpenFolder,
             /// Reveal the tile a key acts on in Finder.
             ShowInFinder,
+            /// Back through the directories visited.
+            GoBack,
+            /// Forward again, after going back.
+            GoForward,
         ]
     );
 }
@@ -62,8 +66,8 @@ pub fn install(cx: &mut App) {
             let _ = window.update(cx, |_, window, _| window.remove_window());
         }
     });
-    // `Rescan`, `OpenFolder` and `ShowInFinder` are handled by the window,
-    // which owns the scan and the selection; see `views::root`.
+    // `Rescan`, `OpenFolder`, `ShowInFinder` and the history are handled by
+    // the window, which owns the scan and the selection; see `views::root`.
     cx.bind_keys([
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-h", Hide, None),
@@ -74,6 +78,9 @@ pub fn install(cx: &mut App) {
         // ⌘R is taken by Rescan, as in a browser; Xcode uses ⌘⇧R-like
         // chords for its reveals, and `o` does the same without a modifier.
         KeyBinding::new("cmd-shift-r", ShowInFinder, None),
+        // Finder's and Safari's back and forward; alt-arrows work too.
+        KeyBinding::new("cmd-[", GoBack, None),
+        KeyBinding::new("cmd-]", GoForward, None),
     ]);
     cx.set_menus([
         Menu::new("disktree").items([
@@ -92,6 +99,10 @@ pub fn install(cx: &mut App) {
             MenuItem::action("Rescan", Rescan),
             MenuItem::separator(),
             MenuItem::action("Close Window", CloseWindow),
+        ]),
+        Menu::new("Go").items([
+            MenuItem::action("Back", GoBack),
+            MenuItem::action("Forward", GoForward),
         ]),
     ]);
 }

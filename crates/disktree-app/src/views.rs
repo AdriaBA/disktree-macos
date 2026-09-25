@@ -75,6 +75,19 @@ pub fn root(
                 this.reveal_target(cx);
             },
         ))
+        // Only where the history buttons are: the review screen has none.
+        .on_action(cx.listener(|this, _: &crate::app_menu::GoBack, _, cx| {
+            if this.screen == Screen::Explore {
+                this.go_back(cx);
+            }
+        }))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::GoForward, _, cx| {
+                if this.screen == Screen::Explore {
+                    this.go_forward(cx);
+                }
+            },
+        ))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             if this.zoom_interface(event, window) {
                 cx.notify();

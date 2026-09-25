@@ -158,8 +158,8 @@ continuous motion, with the directory's contents growing into place. Scroll the
 other way to come back out. Enter goes into the selected directory at any
 depth, and Backspace or Escape goes up one level. `<` and `>`, beside the
 Size / Files / Age switch, go back and forward through the directories visited,
-as do `alt ←` `alt →` and the mouse's side buttons. `+` and `-` magnify without
-going in; `0` resets.
+as do `alt ←` `alt →` (also `⌘[` `⌘]` on macOS) and the mouse's side
+buttons. `+` and `-` magnify without going in; `0` resets.
 
 ### Removing
 
