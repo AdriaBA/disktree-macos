@@ -1165,3 +1165,86 @@ fn marking_a_directory_marks_everything_inside_it(cx: &mut TestAppContext) {
     update(&view, cx, |app, cx| app.toggle_mark(&junk, cx));
     assert!(read(&view, cx, |app| app.marks.is_empty()));
 }
+
+/// `<` and `>` retrace the directories visited, are disabled when there is
+/// nowhere to go, and a fresh move ends what was ahead.
+#[gpui_kit::test]
+fn back_and_forward_retrace_where_you_have_been(cx: &mut TestAppContext) {
+    use gpui_kit::Modifiers;
+
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    cx.simulate_resize(gpui_kit::size(px(1400.), px(900.)));
+    draw(cx);
+    let can = |view: &Entity<Disktree>, cx: &Window| {
+        read(view, cx, |app| (app.can_go_back(), app.can_go_forward()))
+    };
+    assert_eq!(can(&view, cx), (false, false), "nowhere to go yet");
+
+    let (junk, deeper, keep) = update(&view, cx, |app, cx| {
+        let junk = child_crumbs(app, &[], "junk");
+        let deeper = child_crumbs(app, &junk, "deeper");
+        let keep = child_crumbs(app, &[], "keep");
+        app.select(Some(deeper.clone()), cx);
+        app.descend(cx);
+        (junk, deeper, keep)
+    });
+    draw(cx);
+    assert_eq!(can(&view, cx), (true, false));
+
+    // Hovering `<` shows the card for where it goes, as hovering a tile
+    // does: here, the scanned root. It hangs below the button, never on it.
+    let back = cx
+        .debug_bounds("history-back")
+        .expect("the button is drawn");
+    cx.simulate_mouse_move(back.center(), None, Modifiers::none());
+    draw(cx);
+    let card = cx.debug_bounds("history-tip").expect("the card is shown");
+    assert!(card.top() >= back.bottom(), "{card:?} covers {back:?}");
+    assert_eq!(
+        read(&view, cx, |app| app.history_target(true)),
+        Some((0, Vec::new()))
+    );
+
+    let click = |cx: &mut Window, selector: &'static str| {
+        let bounds = cx.debug_bounds(selector).expect("the button is drawn");
+        cx.simulate_click(bounds.center(), Modifiers::none());
+        draw(cx);
+    };
+    click(cx, "history-back");
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        Vec::<usize>::new()
+    );
+    assert_eq!(can(&view, cx), (false, true), "back at the start");
+
+    click(cx, "history-forward");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+    assert_eq!(can(&view, cx), (true, false));
+
+    // Up a level is a move of its own, and the keys retrace it too.
+    press(cx, "backspace");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), junk);
+    press(cx, "alt-left");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+    press(cx, "alt-left");
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        Vec::<usize>::new()
+    );
+    press(cx, "alt-right");
+    assert_eq!(read(&view, cx, |app| app.crumbs.clone()), deeper);
+
+    // Going somewhere new from the middle of the history drops what was
+    // ahead of it, as in a browser.
+    press(cx, "alt-left");
+    update(&view, cx, |app, cx| app.go_to(keep, cx));
+    draw(cx);
+    assert_eq!(can(&view, cx), (true, false), "the forward trail is gone");
+    press(cx, "alt-left");
+    assert_eq!(
+        read(&view, cx, |app| app.crumbs.clone()),
+        Vec::<usize>::new()
+    );
+}

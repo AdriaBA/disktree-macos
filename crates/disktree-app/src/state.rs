@@ -26,8 +26,8 @@ use disktree_core::treemap::{
 };
 use gpui_kit::{
     Context, FocusHandle, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, Pixels, Point, Render, ScrollDelta, ScrollWheelEvent, Size,
-    Window, px, size,
+    MouseMoveEvent, NavigationDirection, Pixels, Point, Render, ScrollDelta,
+    ScrollWheelEvent, Size, Window, px, size,
 };
 use gpui_omarchy::Status;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -297,6 +297,20 @@ struct LayoutKey {
     filter: u64,
 }
 
+/// Directories left behind and come back from, for `<` and `>`.
+///
+/// Kept as absolute paths, not crumbs: a re-scan or a widening renumbers the
+/// tree, and crumbs would then silently point at other directories.
+#[derive(Clone, Debug, Default)]
+pub struct History {
+    pub back: Vec<PathBuf>,
+    pub forward: Vec<PathBuf>,
+}
+
+/// How many directories back is remembered. Far more than anyone clicks
+/// through, and small enough that pruning after a scan costs nothing.
+const HISTORY_DEPTH: usize = 100;
+
 /// Result of the removal run, summarised for the final screen.
 #[derive(Clone, Debug, Default)]
 pub struct RunSummary {
@@ -323,6 +337,10 @@ pub struct Disktree {
     pub crumbs: Vec<usize>,
     pub selected: Option<Vec<usize>>,
     pub hovered: Option<Vec<usize>>,
+    pub history: History,
+    /// The history button under the pointer, `true` for `<`: its card is
+    /// drawn below it for as long as it is.
+    pub history_hover: Option<bool>,
     /// The pointer moved more recently than the keyboard navigated. Then the
     /// tile under the pointer is what Space, X and Enter act on; after an
     /// arrow or Tab it is the keyboard selection again.
@@ -430,6 +448,8 @@ impl Disktree {
             crumbs: Vec::new(),
             selected: None,
             hovered: None,
+            history: History::default(),
+            history_hover: None,
             pointer_active: false,
             view: View::default(),
             transition: None,
@@ -551,6 +571,7 @@ impl Disktree {
         self.scan_started = Some(Instant::now());
         self.scan_elapsed = None;
         self.scan_root.clone_from(&above);
+        self.remember();
         let known = Known {
             path: self.root_path.clone(),
             tree,
@@ -632,6 +653,10 @@ impl Disktree {
         let epoch = self.scan_epoch;
         self.progress = ScanSnapshot::default();
         self.scan_error = None;
+        // A new scan starts at its root; where it was is one `<` away.
+        if !self.crumbs.is_empty() {
+            self.remember();
+        }
         self.tree = None;
         self.crumbs.clear();
         self.selected = None;
@@ -718,6 +743,7 @@ impl Disktree {
                     });
                 }
                 self.keep_selection_valid();
+                self.prune_history();
                 self.select_largest(cx);
             }
             Err(error) => self.scan_error = Some(error.to_string()),
@@ -988,6 +1014,7 @@ impl Disktree {
         if !node.is_dir() || node.children.is_empty() {
             return;
         }
+        self.remember();
         self.selected = Some(target.clone());
         self.crumbs = target;
         self.forget_hover();
@@ -1040,18 +1067,27 @@ impl Disktree {
     /// Ascend to the parent directory, keeping the directory we came from in
     /// view so the motion reads as zooming out.
     pub fn ascend(&mut self, cx: &mut Context<'_, Self>) {
-        let Some(parent_crumbs) = self.parent_crumbs() else {
-            return;
-        };
+        if let Some(parent_crumbs) = self.parent_crumbs() {
+            self.ascend_to(parent_crumbs, cx);
+        }
+    }
+
+    /// Make `ancestor`, a directory above the current root, the root.
+    ///
+    /// The directory we leave shrinks back into its tile when that tile is
+    /// drawn at the new level; from further up it is too small to track, and
+    /// the new level simply lands.
+    fn ascend_to(&mut self, ancestor: Vec<usize>, cx: &mut Context<'_, Self>) {
+        self.remember();
         // The region we are looking at now, and where it sits in the layout
         // we are going back to.
         let area = self.treemap_size.get();
         let child_crumbs = self.crumbs.clone();
         let src = self.view.visible_base(area);
-        self.crumbs.clone_from(&parent_crumbs);
+        self.crumbs.clone_from(&ancestor);
         self.forget_hover();
         self.cache = None;
-        self.selected = Some(parent_crumbs);
+        self.selected = Some(ancestor);
         self.view = View::IDENTITY;
         self.transition = self
             .tile_body(&child_crumbs)
@@ -1075,6 +1111,10 @@ impl Disktree {
     /// it lands immediately, the way selecting a folder does.
     pub fn go_to(&mut self, crumbs: Vec<usize>, cx: &mut Context<'_, Self>) {
         self.crumb_menu = None;
+        // A reveal in the directory on screen goes nowhere.
+        if crumbs != self.crumbs {
+            self.remember();
+        }
         self.crumbs.clone_from(&crumbs);
         self.selected = Some(crumbs);
         self.forget_hover();
@@ -1082,6 +1122,117 @@ impl Disktree {
         self.transition = None;
         self.cache = None;
         cx.notify();
+    }
+
+    /// Note the directory on screen as one to come back to, before leaving
+    /// it. A new departure ends whatever was ahead, as in a browser.
+    fn remember(&mut self) {
+        if self.tree.is_none() {
+            return;
+        }
+        let here = self.current_path();
+        if self.history.back.last() != Some(&here) {
+            self.history.back.push(here);
+        }
+        if self.history.back.len() > HISTORY_DEPTH {
+            self.history.back.remove(0);
+        }
+        self.history.forward.clear();
+    }
+
+    /// Drop what a new tree no longer holds: a removed directory, or one
+    /// outside a new root. What is left always resolves, so `<` and `>` are
+    /// enabled exactly when they would go somewhere.
+    fn prune_history(&mut self) {
+        let mut history = std::mem::take(&mut self.history);
+        history
+            .back
+            .retain(|path| self.crumbs_for_path(path).is_some());
+        history
+            .forward
+            .retain(|path| self.crumbs_for_path(path).is_some());
+        self.history = history;
+    }
+
+    /// Whether `<` would go anywhere: what drives its button's disabled state.
+    pub fn can_go_back(&self) -> bool {
+        self.history_target(true).is_some()
+    }
+
+    /// Whether `>` would go anywhere.
+    pub fn can_go_forward(&self) -> bool {
+        self.history_target(false).is_some()
+    }
+
+    /// `<`: the directory on screen before this one.
+    pub fn go_back(&mut self, cx: &mut Context<'_, Self>) {
+        self.step_history(true, cx);
+    }
+
+    /// `>`: undo a `<`.
+    pub fn go_forward(&mut self, cx: &mut Context<'_, Self>) {
+        self.step_history(false, cx);
+    }
+
+    /// Where `<` (or `>`) would go, and its place on that stack: the newest
+    /// entry that is somewhere else. An entry can be where we already are,
+    /// after a widening that was superseded; it is skipped rather than spend
+    /// a click on nothing. Every other entry resolves, being pruned whenever
+    /// a tree lands.
+    pub fn history_target(&self, back: bool) -> Option<(usize, Vec<usize>)> {
+        self.tree.as_ref()?;
+        let stack = if back {
+            &self.history.back
+        } else {
+            &self.history.forward
+        };
+        stack.iter().enumerate().rev().find_map(|(at, path)| {
+            self.crumbs_for_path(path)
+                .filter(|crumbs| *crumbs != self.crumbs)
+                .map(|crumbs| (at, crumbs))
+        })
+    }
+
+    fn step_history(&mut self, back: bool, cx: &mut Context<'_, Self>) {
+        let Some((at, target)) = self.history_target(back) else {
+            return;
+        };
+        let here = self.current_path();
+        let mut history = std::mem::take(&mut self.history);
+        let (from, to) = if back {
+            (&mut history.back, &mut history.forward)
+        } else {
+            (&mut history.forward, &mut history.back)
+        };
+        from.truncate(at);
+        to.push(here);
+        // The move is an ordinary one, animation and all; it records itself
+        // like any other, so the stacks are put back afterwards.
+        self.travel(target, cx);
+        self.history = history;
+        cx.notify();
+    }
+
+    /// Go to `target` with the motion that fits: grow into a directory
+    /// below, shrink back out to one above, or land on one beside.
+    fn travel(&mut self, target: Vec<usize>, cx: &mut Context<'_, Self>) {
+        let enterable = self
+            .node_at(&target)
+            .is_some_and(|node| node.is_dir() && !node.children.is_empty());
+        if target.len() > self.crumbs.len()
+            && target.starts_with(&self.crumbs)
+            && enterable
+        {
+            let from =
+                self.tile_body(&target).map(|rect| self.view.project(rect));
+            self.enter(target, from, cx);
+        } else if target.len() < self.crumbs.len()
+            && self.crumbs.starts_with(&target)
+        {
+            self.ascend_to(target, cx);
+        } else {
+            self.go_to(target, cx);
+        }
     }
 
     /// Show `crumbs` in its directory, selected: what a "worth a look" row
@@ -1962,6 +2113,7 @@ impl Disktree {
         let key = event.keystroke.key.as_str();
         let control = event.keystroke.modifiers.control;
         let shift = event.keystroke.modifiers.shift;
+        let alt = event.keystroke.modifiers.alt;
 
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
@@ -2012,6 +2164,9 @@ impl Disktree {
         }
 
         match self.screen {
+            // Alt-arrows are history in every browser and file manager.
+            Screen::Explore if alt && key == "left" => self.go_back(cx),
+            Screen::Explore if alt && key == "right" => self.go_forward(cx),
             Screen::Explore => self.on_explore_key(key, control, shift, cx),
             Screen::Review => self.on_review_key(key, cx),
             Screen::Running => {
@@ -2270,6 +2425,12 @@ impl Disktree {
                 if let Some(crumbs) = crumbs {
                     self.toggle_mark(&crumbs, cx);
                 }
+            }
+            MouseButton::Navigate(NavigationDirection::Back) => {
+                self.go_back(cx);
+            }
+            MouseButton::Navigate(NavigationDirection::Forward) => {
+                self.go_forward(cx);
             }
             _ => {}
         }

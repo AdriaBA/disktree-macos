@@ -688,6 +688,84 @@ fn view_settings(
     };
 
     let theme = cx.omarchy().clone();
+    // Back and forward through the directories visited, beside the choices
+    // that change how the one on screen is drawn.
+    let travel = |id: &'static str,
+                  label: &'static str,
+                  enabled: bool,
+                  back: bool,
+                  go: fn(&mut Disktree, &mut Context<'_, Disktree>),
+                  cx: &mut Context<'_, Disktree>| {
+        let shown = app.history_hover == Some(back);
+        div()
+            .id(ElementId::Name(format!("{id}-hover").into()))
+            .debug_selector(move || id.into())
+            .relative()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                // Leaving one button can be reported after entering the
+                // other; only the button that owns the card takes it away.
+                if *hovered {
+                    this.history_hover = Some(back);
+                } else if this.history_hover == Some(back) {
+                    this.history_hover = None;
+                }
+                cx.notify();
+            }))
+            .child(
+                button(id, label, ButtonVariant::Secondary, cx)
+                    .tab_stop(false)
+                    .disabled(!enabled)
+                    // Borderless: glyphs on the bar, not controls in a
+                    // frame. Hover keeps the fill but not the outline it
+                    // would add.
+                    .hover(|style| {
+                        style
+                            .bg(theme.hover_fill())
+                            .border_color(theme.foreground.opacity(0.))
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        go(this, cx);
+                        window.focus(&this.focus, cx);
+                    })),
+            )
+            .when(shown, |this| {
+                // Anchored to a holder pinned at the button's bottom edge, so
+                // the card hangs below it and never covers it; deferred so it
+                // paints over the mosaic.
+                this.child(
+                    div().absolute().top_full().left_0().child(
+                        deferred(
+                            anchored()
+                                .snap_to_window_with_margin(px(8.))
+                                .offset(gpui_kit::point(px(0.), px(4.)))
+                                .child(history_card(app, back, cx)),
+                        )
+                        .with_priority(2),
+                    ),
+                )
+            })
+    };
+    let history = div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .child(travel(
+            "history-back",
+            "<",
+            app.can_go_back(),
+            true,
+            Disktree::go_back,
+            cx,
+        ))
+        .child(travel(
+            "history-forward",
+            ">",
+            app.can_go_forward(),
+            false,
+            Disktree::go_forward,
+            cx,
+        ));
+
     let depth = app.layout_options.max_depth;
     let stepper = |id: &'static str,
                    label: &'static str,
@@ -727,6 +805,7 @@ fn view_settings(
         .items_center()
         .gap(space::SM)
         .flex_shrink_0()
+        .child(history)
         .child(mode)
         .child(hidden)
         .child(apparent)
@@ -2592,37 +2671,80 @@ pub fn cursor_tooltip(
         anchor_y + gap
     };
 
-    // The same surface treatment as Omarchy's tooltip, square and bordered,
-    // so an anchored surface of this app does not drift from the system's.
-    // Translucent so the mosaic stays visible underneath it.
-    let theme = cx.omarchy();
     Some(
-        div()
+        card_surface(cx)
             .absolute()
             .left(px(x))
             .top(px(y))
-            .w(size::TOOLTIP)
-            .flex()
-            .flex_col()
-            .gap(space::XS)
-            .px(space::SM)
-            .py(space::SM)
-            .border_1()
-            .border_color(theme.control_border())
-            .bg(theme.background.opacity(0.93))
-            .text_color(theme.foreground)
-            .font_family(theme.font.clone())
-            .text_size(text::CAPTION)
             .child(content),
     )
 }
 
+/// The same surface treatment as Omarchy's tooltip, square and bordered,
+/// so an anchored surface of this app does not drift from the system's.
+/// Translucent so the mosaic stays visible underneath it.
+fn card_surface(cx: &gpui_kit::App) -> Div {
+    let theme = cx.omarchy();
+    div()
+        .w(size::TOOLTIP)
+        .flex()
+        .flex_col()
+        .gap(space::XS)
+        .px(space::SM)
+        .py(space::SM)
+        .border_1()
+        .border_color(theme.control_border())
+        .bg(theme.background.opacity(0.93))
+        .text_color(theme.foreground)
+        .font_family(theme.font.clone())
+        .text_size(text::CAPTION)
+}
+
+/// The card under `<` or `>` while it is hovered: what hovering a tile
+/// shows, for the directory the button goes to, so where it leads is known
+/// before going. Drawn by the app rather than as a tooltip, which GPUI puts
+/// at the pointer, over the button itself.
+fn history_card(app: &Disktree, back: bool, cx: &gpui_kit::App) -> Div {
+    let (label, keys) = if back {
+        ("Back", "alt \u{2190} back")
+    } else {
+        ("Forward", "alt \u{2192} forward")
+    };
+    let card = app
+        .history_target(back)
+        .and_then(|(_, crumbs)| node_card(app, &crumbs, keys, cx));
+    card_surface(cx)
+        .debug_selector(|| "history-tip".into())
+        .map(|surface| match card {
+            Some(card) => surface.child(card),
+            // Nowhere to go: the button is disabled; say what it is for.
+            None => surface.child(format!("{label} \u{00b7} {keys}")),
+        })
+}
+
 /// The tooltip content for the hovered tile: everything the tile cannot show.
 pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
+    let crumbs = app.hovered.as_deref()?;
+    let is_dir = app.node_at(crumbs)?.is_dir();
+    let keys = if is_dir {
+        "space mark · enter open"
+    } else {
+        "space mark"
+    };
+    node_card(app, crumbs, keys, cx)
+}
+
+/// What is known about the node at `crumbs`, as a card: name, path, size and
+/// share, counts, and badges, with `keys` for what can be done from there.
+fn node_card(
+    app: &Disktree,
+    crumbs: &[usize],
+    keys: &str,
+    cx: &gpui_kit::App,
+) -> Option<Div> {
     let theme = cx.omarchy();
-    let crumbs = app.hovered.clone()?;
-    let node = app.node_at(&crumbs)?;
-    let path = app.path_at(&crumbs);
+    let node = app.node_at(crumbs)?;
+    let path = app.path_at(crumbs);
     let parent = crumbs[..crumbs.len().saturating_sub(1)].to_vec();
     let parent_value = app.node_at(&parent).map_or(0, |node| node.bytes);
     let marked = path.as_deref().is_some_and(|path| app.marks.contains(path));
@@ -2725,11 +2847,7 @@ pub fn hover_tooltip(app: &Disktree, cx: &gpui_kit::App) -> Option<Div> {
         div()
             .text_size(text::CAPTION)
             .text_color(theme.secondary.opacity(0.7))
-            .child(if node.is_dir() {
-                "space mark · enter open"
-            } else {
-                "space mark"
-            }),
+            .child(keys.to_string()),
     );
     Some(tip)
 }
@@ -2738,11 +2856,15 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
-    let rows: [(&str, &str); 24] = [
+    let rows: [(&str, &str); 25] = [
         ("space / x", "Mark or unmark the tile you point at"),
         ("ctrl-click", "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
         ("\u{232b} / esc", "Go up one directory"),
+        (
+            "alt \u{2190} / \u{2192}",
+            "Back or forward through where you have been",
+        ),
         (
             "\u{2190} \u{2191} \u{2193} \u{2192}",
             "Move between tiles at this level",
