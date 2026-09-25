@@ -5,6 +5,8 @@
 //! live free-space meter. Marking is non-destructive until the review screen
 //! is confirmed.
 
+mod app_menu;
+mod appearance;
 mod git;
 mod marks;
 mod palette;
@@ -65,6 +67,12 @@ fn main() -> Result<()> {
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx| {
             gpui_omarchy::init(cx);
+            app_menu::install(cx);
+            let home = std::env::var_os("HOME").map(PathBuf::from);
+            let native_look = appearance::follows_system(home.as_deref());
+            if native_look {
+                appearance::apply(cx.window_appearance(), cx);
+            }
             let options = args.options.clone();
             let root_for_app = root.clone();
             let window = cx
@@ -82,9 +90,7 @@ fn main() -> Result<()> {
                                     "disktree · {}",
                                     marks::display_path(
                                         &title_root,
-                                        std::env::var_os("HOME")
-                                            .map(PathBuf::from)
-                                            .as_deref(),
+                                        home.as_deref(),
                                     )
                                 )
                                 .into(),
@@ -96,7 +102,10 @@ fn main() -> Result<()> {
                         window_min_size: Some(size(px(900.), px(600.))),
                         ..Default::default()
                     },
-                    move |_, cx| {
+                    move |window, cx| {
+                        if native_look {
+                            appearance::follow(window);
+                        }
                         cx.new(|cx| {
                             Disktree::new(
                                 root_for_app.clone(),
@@ -159,6 +168,9 @@ fn parse_args() -> Result<Args> {
                     ),
                 };
             }
+            // Launch Services added a process serial number when opening an
+            // app from Finder until OS X 10.9, and some launchers still do.
+            other if other.starts_with("-psn_") => {}
             other if other.starts_with('-') => {
                 anyhow::bail!("unknown option {other}\n\n{USAGE}");
             }

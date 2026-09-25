@@ -350,6 +350,8 @@ pub struct Disktree {
     /// Focus to move on the next occasion a window is in hand. Key handling
     /// has no window, and opening or closing the dialog must move focus.
     pub focus_request: Option<FocusTarget>,
+    /// What the titlebar says, so it is only set when it changes.
+    window_title: String,
     /// The window's `rem` in pixels, read each frame. The mosaic is laid out
     /// in pixels, so its header band and label thresholds are scaled by this
     /// to follow interface zoom like the rest of the interface.
@@ -393,8 +395,11 @@ pub struct Disktree {
     git_pending: FxHashSet<PathBuf>,
     /// The device the scanned volume is mounted from.
     pub device: Option<String>,
-    /// The top of the disk the home directory lives on: what "Whole disk"
-    /// scans.
+    /// Whether macOS lets this process read everything: asked once, since a
+    /// grant only takes effect after a relaunch. `None` off macOS.
+    pub full_disk_access: Option<bool>,
+    /// The top of the disk the scanned root lives on: what "Whole disk"
+    /// scans. Follows the root when a folder is opened.
     pub disk_root: Option<PathBuf>,
     /// The side panel's width, in rem; dragged from its left edge.
     pub panel_rems: f32,
@@ -453,6 +458,7 @@ impl Disktree {
             confirm_open: false,
             confirm_focus: cx.focus_handle(),
             focus_request: None,
+            window_title: String::new(),
             rem: crate::ui::BASE_REM,
             run: None,
             run_epoch: 0,
@@ -478,6 +484,7 @@ impl Disktree {
             git: FxHashMap::default(),
             git_pending: FxHashSet::default(),
             device: None,
+            full_disk_access: None,
             disk_root: None,
             panel_rems: PANEL_REMS,
             scan_started: None,
@@ -486,11 +493,14 @@ impl Disktree {
             scanned_at: now_seconds(),
         };
         tree.device = device_for(&tree.root_path);
-        tree.disk_root = tree
+        tree.full_disk_access = tree
             .home
             .as_deref()
-            .or(Some(tree.root_path.as_path()))
-            .and_then(volume_root_for);
+            .and_then(disktree_core::access::full_disk_access);
+        // The disk of what is on screen, as `set_root` keeps it: `disktree
+        // /Volumes/Ext` then `g` measures that drive, like opening it with ⌘O.
+        tree.disk_root = volume_root_for(&tree.root_path);
+        disktree_core::removal::prime_mount_points();
         tree.start_scan(cx);
         Self::start_space_ticker(cx);
         tree
@@ -523,6 +533,10 @@ impl Disktree {
     pub fn set_root(&mut self, root: PathBuf, cx: &mut Context<'_, Self>) {
         self.space = space_info(&root).ok();
         self.device = device_for(&root);
+        // "Whole disk" means the disk of what is on screen, which a new root
+        // can change: an external drive has its own.
+        self.disk_root =
+            volume_root_for(&root).or_else(|| self.disk_root.take());
         self.root_path = root;
         self.screen = Screen::Explore;
         self.start_scan(cx);
@@ -1940,16 +1954,72 @@ impl Disktree {
 
     // ── input ───────────────────────────────────────────────────────────
 
-    /// Handle a key press. Returns whether the directory on screen changed,
-    /// which is what keeps the window title honest.
+    /// Handle a key press.
     pub fn on_key_down(
         &mut self,
         event: &KeyDownEvent,
         cx: &mut Context<'_, Self>,
-    ) -> bool {
-        let before = self.crumbs.clone();
+    ) {
         self.dispatch_key(event, cx);
-        self.crumbs != before
+    }
+
+    /// Whether a menu command may replace the tree: where `r` would, not
+    /// behind the confirmation, and not under the review list or a removal
+    /// that is still running.
+    pub fn can_start_over(&self) -> bool {
+        self.screen == Screen::Explore && !self.confirm_open
+    }
+
+    /// Ask for a directory and scan it: an app opened from the Dock has no
+    /// command line to name one.
+    pub fn open_folder(cx: &Context<'_, Self>) {
+        let chosen = cx.prompt_for_paths(gpui_kit::PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Scan".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            // Canonical, like a root from the command line, so a later
+            // widening recognises this tree in the wider walk.
+            let path = path.canonicalize().unwrap_or(path);
+            // The panel does not block the window: the review list or a
+            // removal may have started while it was open.
+            let _ = this.update(cx, |this, cx| {
+                if this.can_start_over() {
+                    this.set_root(path, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Show the tile a key acts on in Finder (or the file manager), selected.
+    pub fn reveal_target(&mut self, cx: &mut Context<'_, Self>) {
+        let crumbs =
+            self.action_target().unwrap_or_else(|| self.crumbs.clone());
+        let Some(path) = self.path_at(&crumbs) else {
+            return;
+        };
+        // GPUI's reveal cannot report failure, so check what it can't.
+        if std::fs::symlink_metadata(&path).is_err() {
+            self.notice = Some((
+                format!(
+                    "{} is no longer on disk",
+                    crate::marks::display_path(&path, self.home.as_deref())
+                ),
+                Status::Warning,
+            ));
+            cx.notify();
+            return;
+        }
+        cx.reveal_path(&path);
     }
 
     /// Every binding, in reading order of the hint bar, so the keys and the
@@ -1966,6 +2036,14 @@ impl Disktree {
         // The alert dialog owns Enter and Escape while it is open; a key that
         // bubbles up to here must not also act on the screen behind it.
         if self.confirm_open {
+            return;
+        }
+
+        // ⌘ chords belong to the menu bar (⌘Q, ⌘W, ⌘R) or to the system.
+        // Read as plain letters they would act twice or by surprise: ⌘D
+        // would re-scan with apparent sizes, ⌘H would hide *and* toggle.
+        // Zoom (⌘= ⌘- ⌘0) is handled before this, with a window in hand.
+        if event.keystroke.modifiers.platform {
             return;
         }
 
@@ -2141,6 +2219,7 @@ impl Disktree {
                 self.show_selection = !self.show_selection;
                 cx.notify();
             }
+            "o" if !control => self.reveal_target(cx),
             "?" => {
                 self.show_help = true;
                 cx.notify();
@@ -2457,6 +2536,19 @@ impl Render for Disktree {
     ) -> impl gpui_kit::IntoElement {
         self.rem = window.rem_size().as_f32();
         self.tick_transition(window);
+        // The titlebar names the directory on screen, however it got there:
+        // a key, a click, a rescan or a folder chosen from the menu.
+        let title = format!(
+            "disktree · {}",
+            crate::marks::display_path(
+                &self.current_path(),
+                self.home.as_deref()
+            )
+        );
+        if title != self.window_title {
+            window.set_window_title(&title);
+            self.window_title = title;
+        }
         crate::views::root(self, window, cx)
     }
 }

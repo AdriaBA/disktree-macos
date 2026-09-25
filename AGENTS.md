@@ -18,6 +18,7 @@ make run                        # build and run, scanning $HOME
 make install                    # ~/.local: binary, desktop entry, icon
 make install PREFIX=/usr/local  # system-wide (needs root)
 make uninstall
+make bundle                     # macOS: target/bundle/disktree.app and its zip
 make lint                       # rustfmt --check, then clippy --all-targets -D warnings
 make test                       # core and window-harness tests
 make ci                         # lint, then test
@@ -29,6 +30,11 @@ release binary, `packaging/disktree.desktop.in` (rendered with the real install
 prefix and the crate version) and `assets/disktree.svg`. Keep the desktop
 entry's `Categories` to a single main category plus additional ones, or
 `desktop-file-validate` complains.
+
+On macOS `make install` installs `target/bundle/disktree.app` into
+`~/Applications` instead, built by `cargo xtask bundle` from
+`packaging/macos/` (the `Info.plist` template and the icon's SVG). The bundle
+identifier there keys every macOS permission grant; do not change it lightly.
 
 `cargo xtask lint` is the gate. It must be green before anything is called
 done, and it must not fix anything: a red local run is the same signal CI gives.

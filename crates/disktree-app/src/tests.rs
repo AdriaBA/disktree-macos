@@ -467,6 +467,38 @@ fn the_help_overlay_opens_and_closes(cx: &mut TestAppContext) {
 }
 
 #[gpui_kit::test]
+fn showing_a_tile_that_is_gone_says_so_instead(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // The selection is .cache, the largest; take it away behind the tree.
+    std::fs::remove_dir_all(temp.path().join(".cache")).expect("remove");
+    press(cx, "o");
+    let notice = read(&view, cx, |app| app.notice.clone());
+    let (message, _) = notice.expect("a notice");
+    assert!(message.contains("no longer on disk"), "{message}");
+}
+
+#[gpui_kit::test]
+fn command_chords_are_not_read_as_plain_letters(cx: &mut TestAppContext) {
+    cx.update(gpui_omarchy::init);
+    let temp = fixture();
+    let (view, cx) = view_over(temp.path(), cx);
+    draw(cx);
+
+    // ⌘P and ⌘D are the menu bar's or nobody's; read as `p` and `d` they
+    // would hide the selection and re-scan.
+    let shown = read(&view, cx, |app| app.show_selection);
+    press(cx, "cmd-p cmd-d");
+    assert_eq!(read(&view, cx, |app| app.show_selection), shown);
+    assert!(read(&view, cx, |app| app.options.apparent_size));
+    press(cx, "p");
+    assert_eq!(read(&view, cx, |app| app.show_selection), !shown);
+}
+
+#[gpui_kit::test]
 fn the_treemap_zooms_with_the_wheel_and_resets(cx: &mut TestAppContext) {
     cx.update(gpui_omarchy::init);
     let temp = fixture();
