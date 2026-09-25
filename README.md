@@ -43,6 +43,49 @@ removes exactly what was installed.
 You need Rust 1.97 or newer and a Wayland or X11 session with a GPU that GPUI
 can drive (Vulkan).
 
+### macOS
+
+Download `disktree-*-aarch64-macos.zip` from the
+[latest release](https://github.com/tobi/disktree/releases/latest), unzip it,
+and drag `disktree.app` into Applications. Apple silicon and macOS 11 or
+newer. A release that was not signed and notarized is stopped by Gatekeeper
+the first time: open it once, then choose **Open Anyway** in System Settings
+› Privacy & Security.
+
+Or build it, with Rust 1.97 or newer and Xcode or its Command Line Tools:
+
+```sh
+make install     # ~/Applications/disktree.app, and ~/.local/bin/disktree
+make uninstall
+```
+
+To see everything, give disktree **Full Disk Access** in System Settings ›
+Privacy & Security (the panel offers a button when it is missing), then
+reopen it. Without it macOS hides Mail, Messages, Safari, other apps' data
+and the Trash, and disktree counts them as unreadable. Started from a
+terminal, it is the terminal that needs the access. macOS also asks once
+each for Desktop, Documents and Downloads.
+
+What is different from Linux:
+
+- **Free space** is what `df` reports. Finder's figure is larger: it counts
+  purgeable space (caches and local snapshots macOS will clear on its own).
+- **Cloned files** (copies APFS shares blocks between, as Finder's Duplicate
+  makes) are each counted in full, so a total can exceed what deleting them
+  frees.
+- **Time Machine's local snapshots** are not files and do not appear; they
+  are part of the gap between the scan and the disk's used space.
+- **Cloud-only folders** (iCloud Drive, Dropbox and the like, evicted to the
+  server) are not opened, so a scan never downloads them.
+
+To sign and notarize a build for others, with a Developer ID certificate in
+the keychain and credentials saved by `xcrun notarytool store-credentials`:
+
+```sh
+NOTARY_PROFILE=<profile> cargo xtask bundle \
+  --sign "Developer ID Application: Name (TEAMID)" --notarize
+```
+
 ## Use
 
 ```sh
@@ -99,9 +142,7 @@ Scroll to magnify toward the pointer. The wheel magnifies until the directory
 under the pointer fills the view, and the next notch goes into it — one
 continuous motion, with the directory's contents growing into place. Scroll the
 other way to come back out. Enter goes into the selected directory at any
-depth, and Backspace or Escape goes up one level. `<` and `>`, beside the
-Size / Files / Age switch, go back and forward through the directories visited,
-as do `alt ←` `alt →` and the mouse's side buttons. `+` and `-` magnify without
+depth, and Backspace or Escape goes up one level. `+` and `-` magnify without
 going in; `0` resets.
 
 ### Removing
@@ -109,9 +150,11 @@ going in; `0` resets.
 `c` (or **Review…**) opens the list of everything marked. Unmark anything
 there, then choose:
 
-- **Move to trash** — the default when a trash is available (`trash-put` from
-  trash-cli, then `gio trash`, then a built-in XDG trash). Recoverable until
-  the trash is emptied, so it commits directly.
+- **Move to trash** — the default when a trash is available. On macOS that is
+  the system Trash, the same move as Finder's (on another disk, that disk's
+  own Trash; network shares often have none). Elsewhere it is `trash-put`
+  from trash-cli, then `gio trash`, then a built-in XDG trash. Recoverable
+  until the trash is emptied, so it commits directly.
 - **Delete permanently** — `rm -rf` semantics. It always asks first, in a dialog
   that names what goes and how much comes back.
 
@@ -123,17 +166,16 @@ and shows how much free space was actually gained.
 | key | does |
 | --- | --- |
 | `space` / `x` | mark or unmark the tile you point at |
-| `ctrl`-click | mark without moving the selection |
+| `ctrl`-click (`⌘`-click on macOS) | mark without moving the selection |
 | `enter` | open that directory, at any depth |
 | `⌫` / `esc` | go up one directory |
-| `alt ←` `alt →` | back and forward through where you have been |
 | `←` `↑` `↓` `→` | move between tiles at this level |
 | `tab` | next largest sibling |
 | scroll | zoom toward a directory, then go into it |
 | `shift`-scroll | pan the magnified view |
 | `[` `]` | draw fewer or more levels at once |
 | `-` `=` `0` | magnify, shrink, reset the view |
-| `ctrl =` `ctrl -` `ctrl 0` | interface zoom |
+| `ctrl =` `ctrl -` `ctrl 0` (`⌘` on macOS) | interface zoom |
 | `/` | filter by name: only matches keep their colour; `enter` shows only them, `esc` clears |
 | `c` | review the marked list |
 | `t` | rank by size or by file count |
@@ -142,8 +184,13 @@ and shows how much free space was actually gained.
 | `r` | scan again |
 | `g` | the whole disk |
 | `p` | show or hide the selection line |
+| `o` | show it in Finder or the file manager |
 | `?` | every key |
 | `q` | quit |
+
+On macOS the menu bar also has ⌘O to open a folder, ⌘⇧R to show the
+selection in Finder, ⌘R to rescan, and ⌘Q, ⌘H and ⌘W (closing the window
+quits); other ⌘ chords are left to the system.
 
 On the review screen: `m` trash, `p` permanent, `!` unmark all, `enter`
 commits, `esc` goes back.
@@ -167,7 +214,9 @@ and removes duplicate hardlinks.
 Click `/` (or any directory above the scanned root) in the trail, press
 `g`, run `disktree --disk`, or use the launcher's *Scan the whole disk*
 action. `g` and `--disk` scan the disk your home directory lives on — `/`
-on Omarchy.
+on Omarchy and on macOS. On macOS the Data volume's second mount,
+`/System/Volumes/Data`, is skipped: it is `/Users`, `/Applications` and the
+rest again under other names.
 
 Widening is memoized: the tree already measured is handed to the wider walk
 and reused where it is reached, so going from `~` to `/` reads only what is
@@ -196,18 +245,25 @@ tested:
 - the filesystem root, the scanned root and your home directory are refused;
 - a mount point is refused, and so is anything with a mount point inside it,
   since removing it would reach into another filesystem; permanent deletion
-  also stops at a device boundary rather than descending into one;
+  also stops at a mount boundary rather than descending into one (a btrfs
+  subvolume that is not mounted goes with its directory, as the scan shows
+  it);
+- a directory holding your home directory or a system tree is refused (on
+  macOS `/Users` is on the same volume as `/`, and `/opt` holds
+  `/opt/homebrew`);
 - system trees (`/usr`, `/etc`, `/boot`, `/var/lib`, `/nix/store`, …) are
   refused even where permissions would allow it: packages own them, and
   pacman, paccache or `journalctl --vacuum` are the tools;
 - a symlink is unlinked, never followed;
-- nothing is passed through a shell — a file called `-rf` is just a file.
+- nothing is passed through a shell — a file called `-rf` is just a file;
+- selecting a checkout never runs a program it names: git is asked with its
+  fsmonitor, hooks and pager off, and a checkout that defines its own filter
+  drivers is not asked for its status at all ("changes unknown").
 
 ## On Hyprland
 
 Hyprland tiles new windows, so disktree opens into whatever tile it is given.
-It is designed for a roomy window; float it, or give it a rule. The window
-class is `disktree`.
+It is designed for a roomy window; float it, or give it a rule:
 
 ```
 windowrule = float, class:^(disktree)$

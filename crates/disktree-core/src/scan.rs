@@ -114,10 +114,11 @@ impl ScanProgress {
 
     fn record_error(&self, path: &Path, error: &io::Error) {
         self.errors.fetch_add(1, Ordering::Relaxed);
-        let message = format!("{}: {error}", path.display());
+        // A scan without Full Disk Access can refuse thousands of paths;
+        // only the ones that will be kept are worth formatting.
         let mut messages = lock(&self.messages);
         if messages.len() < MAX_ERROR_DETAIL {
-            messages.push(message);
+            messages.push(format!("{}: {error}", path.display()));
         }
         drop(messages);
     }
@@ -185,6 +186,7 @@ impl ScanHandle {
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
             foreign_mounts: OnceLock::new(),
+            never_scanned: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
         });
@@ -233,6 +235,7 @@ pub fn scan(root: &Path, options: ScanOptions) -> io::Result<Node> {
         progress: Arc::clone(&progress),
         root_device: Mutex::new(None),
         foreign_mounts: OnceLock::new(),
+        never_scanned: OnceLock::new(),
         visited_dirs: Mutex::new(FxHashSet::default()),
         root: Mutex::new(None),
     });
@@ -252,6 +255,9 @@ struct WalkContext {
     /// Mount points `one_filesystem` keeps out, from the mount table. Unset
     /// when the table cannot be read, and devices are compared instead.
     foreign_mounts: OnceLock<FxHashSet<PathBuf>>,
+    /// Directories no scan enters, on any volume setting: see
+    /// [`crate::space::never_scanned`].
+    never_scanned: OnceLock<FxHashSet<PathBuf>>,
     /// Directories already entered, so followed symlinks cannot loop.
     visited_dirs: Mutex<FxHashSet<(u64, u64)>>,
     /// Set by the root's `complete`, read after the scope joins.
@@ -297,6 +303,23 @@ impl WalkContext {
         }
 
         if file_type.is_dir() {
+            if self
+                .never_scanned
+                .get()
+                .is_some_and(|never| never.contains(&path))
+            {
+                return Classified::Skipped;
+            }
+            // `lstat` at most once per directory: macOS reads the dataless
+            // flag from it, and the device check below needs it wherever the
+            // mount table cannot be read, which on macOS is everywhere.
+            let meta_cell = std::cell::OnceCell::new();
+            let meta = || meta_cell.get_or_init(|| entry.metadata());
+            if cfg!(target_os = "macos")
+                && meta().as_ref().is_ok_and(is_dataless)
+            {
+                return Classified::Skipped;
+            }
             // Memoized: the subtree a narrower scan already measured is
             // taken whole, before any volume rule, since it was measured
             // under the same rules.
@@ -320,18 +343,18 @@ impl WalkContext {
                     return Classified::Skipped;
                 }
             } else if self.options.one_filesystem {
-                let device = entry.metadata().map(|meta| device_of(&meta));
-                match (device, self.root_device(&path)) {
-                    (Ok(device), Some(root_device))
-                        if device != root_device =>
-                    {
+                let device = match meta() {
+                    Ok(meta) => device_of(meta),
+                    Err(error) => {
+                        self.progress.record_error(&path, error);
                         return Classified::Skipped;
                     }
-                    (Err(error), _) => {
-                        self.progress.record_error(&path, &error);
-                        return Classified::Skipped;
-                    }
-                    _ => {}
+                };
+                if self
+                    .root_device(&path)
+                    .is_some_and(|root_device| device != root_device)
+                {
+                    return Classified::Skipped;
                 }
             }
             self.progress.count_dir();
@@ -360,6 +383,7 @@ impl WalkContext {
                         NodeKind::Symlink,
                         size,
                         &meta,
+                        shares_inode(&meta),
                     ))
                 }
                 Err(error) => {
@@ -381,6 +405,11 @@ impl WalkContext {
         };
 
         if meta.is_dir() {
+            // A link into an evicted cloud folder is left alone for the
+            // same reason the folder itself is.
+            if is_dataless(&meta) {
+                return Classified::Skipped;
+            }
             if let Some(key) = file_identity(&meta)
                 && !lock(&self.visited_dirs).insert(key)
             {
@@ -401,7 +430,10 @@ impl WalkContext {
     ) -> Classified {
         let size = measure(meta, self.options.apparent_size);
         self.progress.count_file(size);
-        Classified::Entry(leaf_node(name, kind, size, meta))
+        // A followed link reaches a file a second way, whatever its link
+        // count says.
+        let track = self.options.follow_links || shares_inode(meta);
+        Classified::Entry(leaf_node(name, kind, size, meta, track))
     }
 }
 
@@ -478,10 +510,12 @@ fn scan_blocking(root: &Path, context: &Arc<WalkContext>) -> io::Result<Node> {
             format!("{} is not a directory", root.display()),
         ));
     }
+    let canonical = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let never = crate::space::never_scanned(root, &canonical);
+    let _ = context.never_scanned.set(never.into_iter().collect());
     if context.options.one_filesystem {
         *lock(&context.root_device) = Some(device_of(&root_meta));
-        let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
-        if let Some(foreign) = crate::space::foreign_mounts_for(&root) {
+        if let Some(foreign) = crate::space::foreign_mounts_for(&canonical) {
             let _ = context.foreign_mounts.set(foreign.into_iter().collect());
         }
     }
@@ -607,14 +641,20 @@ fn mark_duplicate_hardlinks(node: &mut Node, seen: &mut FxHashSet<(u64, u64)>) {
     }
 }
 
+/// A leaf. Its `(device, inode)` is kept only when `track` says the walk
+/// could meet the same file again: a hardlink de-duplication set of every
+/// file on a disk is millions of entries, nearly all for files with one name.
 fn leaf_node(
     name: Box<str>,
     kind: NodeKind,
     size: u64,
     meta: &Metadata,
+    track: bool,
 ) -> Node {
     let mut node = Node::entry(name, kind, size);
-    node.inode = file_identity(meta);
+    if track {
+        node.inode = file_identity(meta);
+    }
     node.modified = modified_seconds(meta);
     node
 }
@@ -656,6 +696,37 @@ fn allocated_bytes(meta: &Metadata) -> Option<u64> {
 #[cfg(not(unix))]
 fn allocated_bytes(_meta: &Metadata) -> Option<u64> {
     None
+}
+
+/// Whether a directory's contents are only in the cloud: an iCloud Drive or
+/// File Provider folder macOS has evicted. Listing one makes macOS fetch its
+/// entries from the server, so a disk scan must not; the folder holds no
+/// local blocks, so skipping it loses nothing a scan measures.
+///
+/// A `stat` or `lstat` carries the flag without touching the contents.
+#[cfg(target_os = "macos")]
+fn is_dataless(meta: &Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt as _;
+    // `SF_DATALESS` from <sys/stat.h>; the libc crate does not name it.
+    const SF_DATALESS: u32 = 0x4000_0000;
+    meta.st_flags() & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+const fn is_dataless(_meta: &Metadata) -> bool {
+    false
+}
+
+/// Whether the file has more than one name, so the walk can count it twice.
+#[cfg(unix)]
+fn shares_inode(meta: &Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    meta.nlink() > 1
+}
+
+#[cfg(not(unix))]
+const fn shares_inode(_meta: &Metadata) -> bool {
+    false
 }
 
 #[cfg(unix)]
@@ -948,6 +1019,7 @@ mod tests {
             progress: Arc::clone(&progress),
             root_device: Mutex::new(None),
             foreign_mounts: OnceLock::new(),
+            never_scanned: OnceLock::new(),
             visited_dirs: Mutex::new(FxHashSet::default()),
             root: Mutex::new(None),
         });

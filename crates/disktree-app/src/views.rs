@@ -56,23 +56,32 @@ pub fn root(
         .debug_selector(|| "disktree-root".into())
         .track_focus(&app.focus)
         .key_context("Disktree")
-        // The listener is the only place with a window in hand, so it is also
-        // where the titlebar is kept in step with the directory on screen.
+        .on_action(cx.listener(|this, _: &crate::app_menu::Rescan, _, cx| {
+            // Where `r` would: not behind the confirmation, and not under
+            // the review list or a removal that is still running.
+            if this.can_start_over() {
+                this.start_scan(cx);
+            }
+        }))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::OpenFolder, _, cx| {
+                if this.can_start_over() {
+                    Disktree::open_folder(cx);
+                }
+            },
+        ))
+        .on_action(cx.listener(
+            |this, _: &crate::app_menu::ShowInFinder, _, cx| {
+                this.reveal_target(cx);
+            },
+        ))
         .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
             if this.zoom_interface(event, window) {
                 cx.notify();
                 return;
             }
-            let moved = this.on_key_down(event, cx);
+            this.on_key_down(event, cx);
             this.apply_focus(window, cx);
-            if moved {
-                let path = this.current_path();
-                let title = format!(
-                    "disktree · {}",
-                    crate::marks::display_path(&path, this.home.as_deref())
-                );
-                window.set_window_title(&title);
-            }
         }))
         .relative()
         .flex()
@@ -978,6 +987,7 @@ fn side_panel(
                 .child(marked_section(app, theme, cx)),
         )
         .children(notice_line(app, theme, cx))
+        .children(privacy_line(app, theme, cx))
         .child(disk_section(app, theme, cx))
 }
 
@@ -1499,6 +1509,60 @@ fn notice_line(app: &Disktree, theme: &Theme, cx: &App) -> Option<Div> {
             .text_color(color)
             .text_size(text::CAPTION)
             .child(message),
+    )
+}
+
+/// Why folders were unreadable on macOS, and the one place to fix it.
+///
+/// Only once the scan has hit something it could not read and the process is
+/// known to lack Full Disk Access: an unreadable folder has other causes, and
+/// the hint must not nag when it would not help. A grant needs a relaunch, and
+/// started from a terminal it is the terminal that needs it.
+fn privacy_line(
+    app: &Disktree,
+    theme: &Theme,
+    cx: &Context<'_, Disktree>,
+) -> Option<Div> {
+    if app.progress.errors == 0 || app.full_disk_access != Some(false) {
+        return None;
+    }
+    let color = theme.warning;
+    let errors = app.progress.errors;
+    let noun = if errors == 1 { "item" } else { "items" };
+    Some(
+        div()
+            .flex()
+            .flex_col()
+            .gap(space::SM)
+            .px(space::SM)
+            .py(space::SM)
+            .border_1()
+            .border_color(color.opacity(0.5))
+            .text_size(text::CAPTION)
+            .child(div().text_color(color).child(format!(
+                "macOS kept {} {noun} unreadable. Give disktree Full Disk \
+                 Access, or your terminal if you started it there, then \
+                 reopen it.",
+                widgets::human_count(errors)
+            )))
+            .child(
+                button(
+                    "privacy",
+                    "Open Privacy Settings",
+                    ButtonVariant::Outline,
+                    cx,
+                )
+                .tab_stop(false)
+                .justify_center()
+                .on_click(cx.listener(
+                    |this, _, window, cx| {
+                        cx.open_url(
+                            disktree_core::access::FULL_DISK_ACCESS_SETTINGS,
+                        );
+                        window.focus(&this.focus, cx);
+                    },
+                )),
+            ),
     )
 }
 
@@ -2852,13 +2916,27 @@ fn node_card(
     Some(tip)
 }
 
+/// The modifier the help names for clicks and interface zoom. Both are
+/// accepted everywhere; this is the one each platform's users reach for, and
+/// on macOS ctrl-click is a right-click.
+const MODIFIER_CLICK: &str = if cfg!(target_os = "macos") {
+    "\u{2318}-click"
+} else {
+    "ctrl-click"
+};
+const MODIFIER_ZOOM: &str = if cfg!(target_os = "macos") {
+    "\u{2318} = / - / 0"
+} else {
+    "ctrl = / - / 0"
+};
+
 fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
     let theme = cx.omarchy();
     // Sentence case, and the tile a key acts on is always the one under the
     // pointer if the pointer moved last, else the keyboard selection.
     let rows: [(&str, &str); 25] = [
         ("space / x", "Mark or unmark the tile you point at"),
-        ("ctrl-click", "Mark without moving the selection"),
+        (MODIFIER_CLICK, "Mark without moving the selection"),
         ("enter", "Open that directory, at any depth"),
         ("\u{232b} / esc", "Go up one directory"),
         (
@@ -2874,7 +2952,7 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("shift-scroll", "Pan the magnified view"),
         ("[ / ]", "Draw fewer or more levels at once"),
         ("- / = / 0", "Magnify, shrink, or reset the view"),
-        ("ctrl = / - / 0", "Interface zoom"),
+        (MODIFIER_ZOOM, "Interface zoom"),
         (
             "/",
             "Filter by name: only matches keep their colour; enter shows only them",
@@ -2886,6 +2964,14 @@ fn help_overlay(app: &Disktree, cx: &gpui_kit::App) -> Div {
         ("d", "Disk usage or apparent size"),
         ("i", "Include or skip hidden entries"),
         ("p", "Show or hide the selection line"),
+        (
+            "o",
+            if cfg!(target_os = "macos") {
+                "Show it in Finder"
+            } else {
+                "Show it in the file manager"
+            },
+        ),
         ("q", "Quit"),
         ("", ""),
         (

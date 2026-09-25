@@ -17,3 +17,9 @@ rustc-hash = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+
+# The system trash, through NSFileManager: what Finder's Move to Trash does,
+# without asking to control Finder. Only this backend is used; the crate's
+# Linux and Windows code is not built.
+[target.'cfg(target_os = "macos")'.dependencies]
+trash = { version = "5.2.9", default-features = false }

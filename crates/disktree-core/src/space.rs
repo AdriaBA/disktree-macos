@@ -69,6 +69,7 @@ pub fn space_info(path: &Path) -> io::Result<SpaceInfo> {
 /// The device a path's filesystem is mounted from, such as
 /// `/dev/nvme0n1p2`: the mount with the longest prefix of `path` in
 /// `/proc/self/mounts`. `None` where that table cannot be read.
+#[cfg(not(target_os = "macos"))]
 pub fn device_for(path: &Path) -> Option<String> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -186,6 +187,7 @@ pub fn volume_root(mounts: &[Mount], path: &Path) -> Option<PathBuf> {
 }
 
 /// [`volume_root`] for this machine.
+#[cfg(not(target_os = "macos"))]
 pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -197,6 +199,98 @@ pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
 pub fn foreign_mounts_for(root: &Path) -> Option<Vec<PathBuf>> {
     let table = std::fs::read_to_string("/proc/self/mounts").ok()?;
     Some(foreign_mounts(&parse_mounts(&table), root))
+}
+
+/// The mount points in what macOS's `mount` prints.
+///
+/// One per line: `/dev/disk3s5 on /System/Volumes/Data (apfs, local, …)`.
+/// The point is
+/// between the first ` on ` and the last ` (`, so a name with spaces or
+/// brackets in it survives.
+pub fn parse_macos_mounts(output: &str) -> Vec<PathBuf> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let (_, rest) = line.split_once(" on ")?;
+            let (point, _) = rest.rsplit_once(" (")?;
+            Some(PathBuf::from(point))
+        })
+        .collect()
+}
+
+/// Where the Data volume is mounted on macOS.
+///
+/// Since Catalina `/` is a read-only system volume, and everything the user
+/// can write — `/Users`,
+/// `/Applications`, `/Library`, `/private`, … — lives on the Data volume,
+/// joined into `/` by firmlinks. The two report the same device, and
+/// `/Users` and `/System/Volumes/Data/Users` are the same inode.
+pub const MACOS_DATA_VOLUME: &str = "/System/Volumes/Data";
+
+/// Directories under `root` a scan must never enter, whatever the volume
+/// rules say, given where `root` really is (`canonical`).
+///
+/// On macOS: the Data volume's second mount, which is every firmlinked
+/// directory again under another name, so walking it counts the disk twice;
+/// and `/Network`, an automount point that would reach for a server. The
+/// paths are returned in `root`'s own spelling, because that is how the walk
+/// names what it finds.
+pub fn never_scanned(root: &Path, canonical: &Path) -> Vec<PathBuf> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    [MACOS_DATA_VOLUME, "/Network"]
+        .iter()
+        .filter_map(|skip| Path::new(skip).strip_prefix(canonical).ok())
+        .filter(|below| !below.as_os_str().is_empty())
+        .map(|below| root.join(below))
+        .collect()
+}
+
+/// The top of the disk `path` lives on: its mount point, from `statfs`.
+///
+/// The Data volume answers `/System/Volumes/Data`, but the disk a user
+/// thinks of is `/`, which shows the same files under the names Finder uses
+/// and adds the system volume beside them.
+#[cfg(target_os = "macos")]
+pub fn volume_root_for(path: &Path) -> Option<PathBuf> {
+    let stat = rustix::fs::statfs(path).ok()?;
+    let mount = PathBuf::from(c_chars(&stat.f_mntonname));
+    if mount.as_os_str().is_empty() {
+        return None;
+    }
+    Some(if mount == Path::new(MACOS_DATA_VOLUME) {
+        PathBuf::from("/")
+    } else {
+        mount
+    })
+}
+
+/// The device a path's filesystem is mounted from, such as
+/// `/dev/disk3s5`, from `statfs`.
+#[cfg(target_os = "macos")]
+pub fn device_for(path: &Path) -> Option<String> {
+    // `/` is a snapshot of the system volume (`disk3s1s1`); name the disk
+    // the user's files are on instead, which is what the meter measures.
+    let path = if path == Path::new("/") {
+        Path::new(MACOS_DATA_VOLUME)
+    } else {
+        path
+    };
+    let stat = rustix::fs::statfs(path).ok()?;
+    let device = c_chars(&stat.f_mntfromname);
+    (!device.is_empty()).then_some(device)
+}
+
+/// A NUL-terminated C string field as text.
+#[cfg(target_os = "macos")]
+fn c_chars(field: &[std::ffi::c_char]) -> String {
+    let bytes: Vec<u8> = field
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte as u8)
+        .collect();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 #[cfg(test)]
@@ -269,6 +363,67 @@ tmpfs /tmp tmpfs rw 0 0
             Some("/dev/sda1"),
             "escaped spaces in mount points"
         );
+    }
+
+    #[test]
+    fn macos_mount_points_keep_spaces_and_brackets() {
+        let output = "\
+/dev/disk3s1s1 on / (apfs, sealed, local, read-only, journaled)
+devfs on /dev (devfs, local, nobrowse)
+/dev/disk3s5 on /System/Volumes/Data (apfs, local, journaled, nobrowse)
+map auto_home on /System/Volumes/Data/home (autofs, automounted, nobrowse)
+/dev/disk5s1 on /Volumes/My Disk (2) (apfs, local, nodev, nosuid)
+//tobi@nas/share on /Volumes/share on nas (smbfs, nodev, nosuid)
+";
+        let points: Vec<PathBuf> = [
+            "/",
+            "/dev",
+            MACOS_DATA_VOLUME,
+            "/System/Volumes/Data/home",
+            "/Volumes/My Disk (2)",
+            "/Volumes/share on nas",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        assert_eq!(parse_macos_mounts(output), points);
+    }
+
+    #[test]
+    fn only_macos_skips_the_data_volume_and_in_the_roots_spelling() {
+        let skipped = never_scanned(Path::new("/"), Path::new("/"));
+        let below_system =
+            never_scanned(Path::new("/System/"), Path::new("/System"));
+        let inside =
+            never_scanned(Path::new("/Users/tobi"), Path::new("/Users/tobi"));
+        let itself = never_scanned(
+            Path::new(MACOS_DATA_VOLUME),
+            Path::new(MACOS_DATA_VOLUME),
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                skipped,
+                vec![PathBuf::from(MACOS_DATA_VOLUME), "/Network".into()]
+            );
+            assert_eq!(
+                below_system,
+                vec![PathBuf::from("/System/Volumes/Data")]
+            );
+        } else {
+            assert!(skipped.is_empty() && below_system.is_empty());
+        }
+        assert!(inside.is_empty());
+        assert!(itself.is_empty(), "asking for it by name scans it");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_home_disk_on_macos_is_the_root_and_has_a_device() {
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let home = home.expect("HOME is set");
+        assert_eq!(volume_root_for(&home), Some(PathBuf::from("/")));
+        let device = device_for(Path::new("/")).expect("a device");
+        assert!(device.starts_with("/dev/disk"), "{device}");
     }
 
     #[test]

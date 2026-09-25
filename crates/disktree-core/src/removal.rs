@@ -9,9 +9,11 @@
 //! * [`RemovalMode::Permanent`] — `rm -rf --one-file-system` semantics,
 //!   implemented here rather than by shelling out, so no path ever reaches a
 //!   shell and no filename can be misread as an option.
-//! * [`RemovalMode::Trash`] — move to the desktop trash, using `trash-put`,
-//!   then `gio trash`, then a built-in XDG implementation. The backend is
-//!   detected once and named in the UI so the user knows what actually happens.
+//! * [`RemovalMode::Trash`] — move to the desktop trash. On macOS that is
+//!   always the system Trash, through `NSFileManager`. Elsewhere it is
+//!   `trash-put`, then `gio trash`, then a built-in XDG implementation. The
+//!   backend is detected once and named in the UI so the user knows what
+//!   actually happens.
 
 use std::fs;
 use std::io;
@@ -92,17 +94,19 @@ impl Plan {
 /// looking at is the only thing they consented to act on.
 pub fn plan(targets: &[Target], root: &Path) -> Plan {
     let root = normalize(root);
-    let home = std::env::var_os("HOME").map(PathBuf::from);
     let mut plan = Plan::default();
     let mut accepted: Vec<Target> = Vec::new();
+
     if targets.is_empty() {
         return plan;
     }
     let mounts = mount_points();
+    // Once per plan, not per target: the review screen plans every frame.
+    let home = std::env::var_os("HOME").map(|home| Home::of(Path::new(&home)));
 
     for target in targets {
         let path = normalize(&target.path);
-        if let Some(reason) = refuse(&path, &root, home.as_deref(), &mounts) {
+        if let Some(reason) = refuse(&path, &root, home.as_ref(), &mounts) {
             plan.blocked.push(Blocked {
                 path: target.path.clone(),
                 reason,
@@ -133,13 +137,19 @@ pub fn plan(targets: &[Target], root: &Path) -> Plan {
     plan
 }
 
-/// Why this path must not be removed, if it must not.
 /// Trees the operating system owns. A whole-disk scan shows them, because
 /// they are part of what fills the disk, but files there belong to packages
-/// and removing them by hand breaks the system; pacman, paccache and
-/// `journalctl --vacuum` are the right tools. Refused even where
-/// permissions would allow it, and even inside them.
-const SYSTEM_TREES: [&str; 14] = [
+/// and removing them by hand breaks the system; pacman, paccache,
+/// `journalctl --vacuum` or `brew cleanup` are the right tools. Refused even
+/// where permissions would allow it, and even inside them.
+///
+/// One list for every platform: a macOS tree never exists on Linux, and the
+/// other way round, so the extra entries cost nothing. On macOS `/etc`,
+/// `/var` and `/tmp` are links into `/private`, which a whole-disk scan
+/// reaches by its real name. `/Applications` is left out on purpose: moving
+/// an app to the Trash is how macOS uninstalls it, and the apps macOS ships
+/// live on the read-only system volume anyway.
+const SYSTEM_TREES: [&str; 20] = [
     "/bin",
     "/boot",
     "/dev",
@@ -154,41 +164,134 @@ const SYSTEM_TREES: [&str; 14] = [
     "/usr",
     "/var/lib",
     "/efi",
+    // macOS.
+    "/System",
+    "/Library",
+    "/private",
+    "/cores",
+    "/opt/homebrew",
+    "/Network",
 ];
 
-/// The system tree `path` is in, if any. The home directory is never
-/// system, wherever it lives.
-fn system_tree(path: &Path, home: Option<&Path>) -> Option<&'static str> {
-    if home.is_some_and(|home| path.starts_with(normalize(home))) {
+/// How the guards compare paths: lexically normalized, and on macOS also in
+/// the form Finder shows and without case.
+///
+/// macOS reaches the same directory under two names — `/Users/x` and
+/// `/System/Volumes/Data/Users/x` — and its disks ignore case by default, so
+/// `/library/caches` is `/Library/Caches`. A guard that compared the spelling
+/// would be passed by the other one. Only for judging: what is removed is
+/// always the path as marked.
+fn guard_key(path: &Path) -> PathBuf {
+    guard_key_for(path, cfg!(target_os = "macos"))
+}
+
+fn guard_key_for(path: &Path, macos: bool) -> PathBuf {
+    let path = normalize(path);
+    if !macos {
+        return path;
+    }
+    // The Data volume's own root stays as it is: it is under /System.
+    let path = match path.strip_prefix(crate::space::MACOS_DATA_VOLUME) {
+        Ok(rest) if !rest.as_os_str().is_empty() => Path::new("/").join(rest),
+        _ => path,
+    };
+    PathBuf::from(path.to_string_lossy().to_lowercase())
+}
+
+/// [`SYSTEM_TREES`] with their guard keys, computed once: the review screen
+/// plans on every frame, for every mark.
+fn system_tree_keys() -> &'static [(&'static str, PathBuf)] {
+    static KEYS: std::sync::LazyLock<Vec<(&'static str, PathBuf)>> =
+        std::sync::LazyLock::new(|| {
+            SYSTEM_TREES
+                .iter()
+                .map(|tree| (*tree, guard_key(Path::new(tree))))
+                .collect()
+        });
+    &KEYS
+}
+
+/// The system tree the path keyed `key` is in, if any. The home directory is
+/// never system, wherever it lives.
+fn system_tree(key: &Path, home: Option<&Path>) -> Option<&'static str> {
+    if home.is_some_and(|home| key.starts_with(home)) {
         return None;
     }
-    SYSTEM_TREES
+    system_tree_keys()
         .iter()
-        .find(|tree| path.starts_with(tree))
-        .copied()
+        .find(|(_, tree)| key.starts_with(tree))
+        .map(|(name, _)| *name)
+}
+
+/// A system tree strictly inside the path keyed `key`: removing `/opt` takes
+/// `/opt/homebrew` with it, and `/var` takes `/var/lib`.
+fn system_tree_below(key: &Path) -> Option<&'static str> {
+    system_tree_keys()
+        .iter()
+        .find(|(_, tree)| tree != key && tree.starts_with(key))
+        .map(|(name, _)| *name)
+}
+
+/// The home directory, as the guards compare it: by key, and by identity.
+#[derive(Debug)]
+struct Home {
+    key: PathBuf,
+    /// Device and inode, so a spelling [`guard_key`] cannot fold still
+    /// matches.
+    id: Option<(u64, u64)>,
+}
+
+impl Home {
+    fn of(path: &Path) -> Self {
+        Self {
+            key: guard_key(path),
+            id: fs::metadata(path).ok().and_then(|meta| file_id(&meta)),
+        }
+    }
 }
 
 fn refuse(
     path: &Path,
     root: &Path,
-    home: Option<&Path>,
+    home: Option<&Home>,
     mounts: &[PathBuf],
 ) -> Option<String> {
+    let key = guard_key(path);
+    let home_key = home.map(|home| home.key.as_path());
     if path.parent().is_none() {
         return Some("the filesystem root cannot be removed".into());
     }
     if path == root {
         return Some("the scanned root cannot be removed".into());
     }
-    if home.is_some_and(|home| path == normalize(home)) {
+    if home_key.is_some_and(|home| key == home)
+        || home.and_then(|home| home.id).is_some_and(|id| {
+            fs::symlink_metadata(path)
+                .ok()
+                .and_then(|meta| file_id(&meta))
+                == Some(id)
+        })
+    {
         return Some("the home directory cannot be removed".into());
+    }
+    // On Linux `/home` is usually a mount point of its own and refused as
+    // one; on macOS `/Users` is on the same volume as `/`, and removing it
+    // would empty the home directory before failing on `/Users` itself.
+    if home_key.is_some_and(|home| home.starts_with(&key)) {
+        return Some("it contains the home directory".into());
     }
     if !path.starts_with(root) {
         return Some("outside the scanned root".into());
     }
-    if let Some(system) = system_tree(path, home) {
+    if let Some(system) = system_tree(&key, home_key) {
         return Some(format!(
-            "part of the system under {system}: use the package manager"
+            "part of the system under {system}: remove it with the tool \
+             that installed it"
+        ));
+    }
+    if let Some(system) = system_tree_below(&key) {
+        return Some(format!(
+            "it contains {system}, which is part of the system"
         ));
     }
     if is_mount_point(path) {
@@ -197,7 +300,7 @@ fn refuse(
                 .into(),
         );
     }
-    if let Some(mount) = mount_below(path, mounts) {
+    if let Some(mount) = mount_below(&key, mounts) {
         return Some(format!(
             "{} is mounted inside it: removing it would reach into another \
              filesystem",
@@ -207,26 +310,114 @@ fn refuse(
     None
 }
 
-/// Every mount point on this machine, from the mount table. Empty where the
-/// table cannot be read; the removal walker still stops at a device boundary.
-fn mount_points() -> Vec<PathBuf> {
-    std::fs::read_to_string("/proc/self/mounts")
-        .map(|table| {
+/// `(device, inode)`: what makes two spellings one directory entry.
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the Option is the non-Unix answer, so both arms must agree"
+)]
+#[cfg(unix)]
+fn file_id(meta: &fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+const fn file_id(_meta: &fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// How long a read of the mount table is used before it is read again. A
+/// disk plugged in is noticed within this, and the removal itself stops at a
+/// mount boundary whatever the table said.
+const MOUNTS_FRESH: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The last read of the mount table, and whether a read is under way.
+struct MountCache {
+    read: Option<std::time::Instant>,
+    mounts: Option<Arc<Vec<PathBuf>>>,
+    refreshing: bool,
+}
+
+static MOUNTS: std::sync::Mutex<MountCache> =
+    std::sync::Mutex::new(MountCache {
+        read: None,
+        mounts: None,
+        refreshing: false,
+    });
+
+/// Every mount point on this machine, as guard keys, as last read.
+///
+/// Never blocks on the read: the review screen plans on every frame, and on
+/// macOS the table comes from running `mount`. A stale table starts a read on
+/// its own thread and is used meanwhile; before the first read lands it is
+/// empty, which is why the app primes it at start with
+/// [`prime_mount_points`].
+fn mount_points() -> Arc<Vec<PathBuf>> {
+    let mut cache = MOUNTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let fresh = cache.read.is_some_and(|read| read.elapsed() < MOUNTS_FRESH);
+    if !fresh && !cache.refreshing {
+        cache.refreshing = true;
+        let spawned = thread::Builder::new()
+            .name("disktree-mounts".into())
+            .spawn(|| {
+                let mounts = Arc::new(read_mount_points());
+                let mut cache = MOUNTS
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                cache.mounts = Some(mounts);
+                cache.read = Some(std::time::Instant::now());
+                cache.refreshing = false;
+            });
+        if spawned.is_err() {
+            cache.refreshing = false;
+        }
+    }
+    cache.mounts.clone().unwrap_or_default()
+}
+
+/// Start reading the mount table, so it is there by the time anything is
+/// marked.
+pub fn prime_mount_points() {
+    let _ = mount_points();
+}
+
+/// Read the mount points now: from `/proc/self/mounts`, or on macOS from
+/// `mount`, which has no `/proc`. Empty where neither can be read.
+fn read_mount_points() -> Vec<PathBuf> {
+    let points: Vec<PathBuf> =
+        if let Ok(table) = fs::read_to_string("/proc/self/mounts") {
             crate::space::parse_mounts(&table)
                 .into_iter()
                 .map(|mount| mount.point)
                 .collect()
-        })
-        .unwrap_or_default()
+        } else if cfg!(target_os = "macos") {
+            Command::new("/sbin/mount")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|output| output.status.success())
+                .map(|output| {
+                    crate::space::parse_macos_mounts(&String::from_utf8_lossy(
+                        &output.stdout,
+                    ))
+                })
+                .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+    points.iter().map(|point| guard_key(point)).collect()
 }
 
-/// A mount point strictly inside `path`, if there is one. A scan that stays
-/// on one filesystem never shows what is mounted there, so the user cannot
-/// have meant to remove it.
-fn mount_below<'a>(path: &Path, mounts: &'a [PathBuf]) -> Option<&'a Path> {
+/// A mount point strictly inside the path keyed `key`, if there is one. A
+/// scan that stays on one filesystem never shows what is mounted there, so
+/// the user cannot have meant to remove it.
+fn mount_below<'a>(key: &Path, mounts: &'a [PathBuf]) -> Option<&'a Path> {
     mounts
         .iter()
-        .find(|mount| mount.as_path() != path && mount.starts_with(path))
+        .find(|mount| mount.as_path() != key && mount.starts_with(key))
         .map(PathBuf::as_path)
 }
 
@@ -289,6 +480,9 @@ pub fn normalize(path: &Path) -> PathBuf {
 /// Which tool, if any, moves files to the desktop trash.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TrashBackend {
+    /// The macOS Trash, through `NSFileManager`: the same move as Finder's
+    /// Move to Trash, into the Trash of the volume the item is on.
+    MacOs,
     /// `trash-put` from trash-cli.
     TrashPut,
     /// `gio trash`, present anywhere `GLib` is installed.
@@ -303,13 +497,14 @@ pub enum TrashBackend {
 impl TrashBackend {
     pub const fn is_available(self) -> bool {
         match self {
-            Self::TrashPut | Self::Gio | Self::XdgHome => true,
+            Self::MacOs | Self::TrashPut | Self::Gio | Self::XdgHome => true,
             Self::Unavailable => false,
         }
     }
 
     pub const fn label(self) -> &'static str {
         match self {
+            Self::MacOs => "the Trash",
             Self::TrashPut => "trash-put",
             Self::Gio => "gio trash",
             Self::XdgHome => "XDG trash",
@@ -319,6 +514,7 @@ impl TrashBackend {
 
     pub const fn detail(self) -> &'static str {
         match self {
+            Self::MacOs => "the same Trash as Finder, on the item's own disk",
             Self::TrashPut => {
                 "uses trash-cli, the same trash as your file manager"
             }
@@ -334,6 +530,17 @@ impl TrashBackend {
 }
 
 /// Detect the best available trash backend for this machine.
+///
+/// On macOS the system Trash is always there, and the Linux tools are not
+/// a substitute: Homebrew's `trash-put` writes the XDG layout, which Finder
+/// never shows, so their files would look recoverable and not be.
+#[cfg(target_os = "macos")]
+pub const fn detect_trash_backend() -> TrashBackend {
+    TrashBackend::MacOs
+}
+
+/// Detect the best available trash backend for this machine.
+#[cfg(not(target_os = "macos"))]
 pub fn detect_trash_backend() -> TrashBackend {
     if which("trash-put") {
         TrashBackend::TrashPut
@@ -346,6 +553,7 @@ pub fn detect_trash_backend() -> TrashBackend {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn which(program: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -486,6 +694,7 @@ fn run(
 /// empty it before failing on the mount point itself, so the walk is done here
 /// instead: every directory is opened relative to its parent with
 /// `O_NOFOLLOW`, and one on a different device or mount stops the removal.
+/// (From tobi/disktree#10.)
 #[cfg(unix)]
 pub fn remove_permanently(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
@@ -512,9 +721,8 @@ pub fn remove_permanently(path: &Path) -> io::Result<()> {
 #[cfg(unix)]
 struct Volume {
     device: rustix::fs::Stat,
-    /// The mount the directory belongs to, where the kernel reports it. A bind
-    /// mount of the same filesystem keeps its `st_dev`, so the device alone
-    /// cannot see it.
+    /// The mount the directory belongs to, where the kernel reports it (Linux,
+    /// `statx`). See [`Self::contains`].
     mount: Option<u64>,
 }
 
@@ -527,8 +735,17 @@ impl Volume {
         })
     }
 
-    fn contains(&self, other: &Self) -> bool {
-        self.device.st_dev == other.device.st_dev && self.mount == other.mount
+    /// Whether `other` is on the same mount. Where the kernel names mounts,
+    /// that decides: a btrfs subvolume that is not mounted has its own
+    /// `st_dev` but is the same mount, and the scan showed it as part of the
+    /// volume, so it goes with the directory it is in; a bind mount keeps
+    /// `st_dev` but is a mount of its own, and stops the removal. Without
+    /// mount IDs (macOS) the device decides.
+    const fn contains(&self, other: &Self) -> bool {
+        match (self.mount, other.mount) {
+            (Some(one), Some(two)) => one == two,
+            _ => self.device.st_dev == other.device.st_dev,
+        }
     }
 }
 
@@ -584,7 +801,6 @@ fn remove_contents(
     }
 
     for (name, kind) in entries {
-        let child_path = path.join(OsStr::from_bytes(name.to_bytes()));
         if !matches!(kind, FileType::Directory | FileType::Unknown) {
             unlinkat(dir, &name, AtFlags::empty())?;
             continue;
@@ -599,6 +815,8 @@ fn remove_contents(
             }
             Err(error) => return Err(error.into()),
         };
+        // Only directories need their path, for the message below.
+        let child_path = path.join(OsStr::from_bytes(name.to_bytes()));
         if !top.contains(&Volume::of(&child)?) {
             return Err(io::Error::other(format!(
                 "stopped at {}: another filesystem is mounted there, and \
@@ -619,10 +837,44 @@ pub fn move_to_trash(path: &Path, backend: TrashBackend) -> io::Result<()> {
         TrashBackend::TrashPut => run_tool(Path::new("trash-put"), &[], path),
         TrashBackend::Gio => run_tool(Path::new("gio"), &["trash"], path),
         TrashBackend::XdgHome => trash_via_xdg(path),
+        TrashBackend::MacOs => trash_via_macos(path),
         TrashBackend::Unavailable => Err(io::Error::other(
             "no trash tool is installed; use permanent deletion instead",
         )),
     }
+}
+
+/// Move one path to the macOS Trash.
+///
+/// The `trash` crate resolves the parent directory and keeps the final name,
+/// so a symlink is trashed itself and its target is left alone. A name that is
+/// not UTF-8 is refused rather than handed over: the crate would
+/// percent-encode it into a different path.
+#[cfg(target_os = "macos")]
+fn trash_via_macos(path: &Path) -> io::Result<()> {
+    use trash::macos::{DeleteMethod, TrashContextExtMacos as _};
+
+    if path.to_str().is_none() {
+        return Err(io::Error::other(
+            "the name is not UTF-8, which the Trash cannot take; \
+             use permanent deletion",
+        ));
+    }
+    let mut context = trash::TrashContext::default();
+    // Finder's method asks for permission to control Finder and plays a
+    // sound per call; NSFileManager does neither.
+    context.set_delete_method(DeleteMethod::NsFileManager);
+    context.delete(path).map_err(|error| {
+        io::Error::other(format!(
+            "could not move to the Trash ({error}); network and read-only \
+             disks have none, so use permanent deletion there"
+        ))
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn trash_via_macos(_path: &Path) -> io::Result<()> {
+    Err(io::Error::other("the macOS Trash only exists on macOS"))
 }
 
 /// Run one trash tool on one path.
@@ -762,6 +1014,11 @@ mod tests {
         }
     }
 
+    /// [`system_tree`] for plain paths, keyed the way [`refuse`] keys them.
+    fn tree_of(path: &Path, home: &Path) -> Option<&'static str> {
+        system_tree(&guard_key(path), Some(&guard_key(home)))
+    }
+
     fn tree() -> TempDir {
         let temp = TempDir::new().expect("tempdir");
         fs::create_dir_all(temp.path().join("a/b")).expect("mkdir");
@@ -854,16 +1111,71 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_holding_the_home_directory_is_refused() {
+        // /Users in a whole-disk scan on macOS: the same volume as /, so no
+        // mount point, and removing it would empty home first.
+        let home = Path::new("/Users/tobi");
+        let reason = refuse(
+            Path::new("/Users"),
+            Path::new("/"),
+            Some(&Home::of(home)),
+            &[],
+        )
+        .expect("refused");
+        assert!(reason.contains("home directory"), "{reason}");
+        assert!(
+            refuse(
+                Path::new("/Users/tobi/src"),
+                Path::new("/"),
+                Some(&Home::of(home)),
+                &[]
+            )
+            .is_none(),
+            "inside home is the user's"
+        );
+    }
+
+    #[test]
+    fn a_directory_holding_a_system_tree_is_refused() {
+        let home = Path::new("/Users/tobi");
+        for (path, inside) in [("/opt", "/opt/homebrew"), ("/var", "/var/lib")]
+        {
+            let reason = refuse(
+                Path::new(path),
+                Path::new("/"),
+                Some(&Home::of(home)),
+                &[],
+            )
+            .expect("refused");
+            assert!(reason.contains(inside), "{path}: {reason}");
+        }
+        assert!(
+            refuse(
+                Path::new("/opt/local"),
+                Path::new("/"),
+                Some(&Home::of(home)),
+                &[]
+            )
+            .is_none(),
+            "a sibling of a system tree is not its parent"
+        );
+    }
+
+    #[test]
     fn a_target_with_a_mount_inside_is_refused() {
         let temp = tree();
         let root = temp.path();
-        let mounts = vec![root.join("a/b"), root.join("other")];
+        let mounts =
+            vec![guard_key(&root.join("a/b")), guard_key(&root.join("other"))];
         assert_eq!(
-            mount_below(&root.join("a"), &mounts),
-            Some(root.join("a/b").as_path())
+            mount_below(&guard_key(&root.join("a")), &mounts),
+            Some(guard_key(&root.join("a/b")).as_path())
         );
-        assert_eq!(mount_below(&root.join("a/b"), &mounts), None, "itself");
-        assert_eq!(mount_below(&root.join("a/one.bin"), &mounts), None);
+        assert_eq!(
+            mount_below(&guard_key(&root.join("a/b")), &mounts),
+            None,
+            "itself"
+        );
         let reason =
             refuse(&root.join("a"), root, None, &mounts).expect("refused");
         assert!(reason.contains("mounted inside"), "{reason}");
@@ -871,9 +1183,119 @@ mod tests {
     }
 
     #[test]
-    fn a_home_scan_has_nothing_mounted_below_a_temp_dir() {
+    fn nothing_is_mounted_below_a_temp_dir() {
         let temp = tree();
-        assert_eq!(mount_below(temp.path(), &mount_points()), None);
+        assert_eq!(
+            mount_below(&guard_key(temp.path()), &read_mount_points()),
+            None
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn this_macs_mount_table_is_read_without_proc() {
+        let mounts = read_mount_points();
+        assert!(mounts.contains(&guard_key(Path::new("/"))), "{mounts:?}");
+        // Asked of `mount_below` itself: `refuse` would turn /System/Volumes
+        // away as a system tree before it looked at the mounts.
+        assert!(
+            mount_below(&guard_key(Path::new("/System/Volumes")), &mounts)
+                .is_some(),
+            "the Data volume is mounted there"
+        );
+    }
+
+    #[test]
+    fn the_mount_table_is_read_off_the_calling_thread_and_then_kept() {
+        prime_mount_points();
+        // The first read lands on its own thread; wait for it, briefly.
+        let mut mounts = mount_points();
+        for _ in 0..500 {
+            if !mounts.is_empty() {
+                break;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+            mounts = mount_points();
+        }
+        assert_eq!(*mounts, read_mount_points(), "the same table, cached");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_volume_is_judged_by_its_mount_where_the_kernel_names_one() {
+        let temp = tree();
+        let dir = open_dir(rustix::fs::CWD, temp.path()).expect("open");
+        let here = Volume::of(&dir).expect("volume");
+        let mut other = Volume::of(&dir).expect("volume");
+        assert!(here.contains(&other));
+        // A btrfs subvolume: another device, the same mount.
+        other.device.st_dev = other.device.st_dev.wrapping_add(1);
+        other.mount = Some(7);
+        let mount = Volume {
+            device: here.device,
+            mount: Some(7),
+        };
+        assert!(mount.contains(&other), "same mount, other device");
+        // A bind mount: the same device, another mount.
+        let bind = Volume {
+            device: here.device,
+            mount: Some(8),
+        };
+        assert!(!mount.contains(&bind));
+        // No mount IDs, as on macOS: the device decides.
+        let (mut plain, mut moved) = (
+            Volume::of(&dir).expect("volume"),
+            Volume::of(&dir).expect("volume"),
+        );
+        plain.mount = None;
+        moved.mount = None;
+        moved.device.st_dev = moved.device.st_dev.wrapping_add(1);
+        assert!(!plain.contains(&moved));
+    }
+
+    #[test]
+    fn macos_guard_keys_fold_the_data_volume_and_case() {
+        let key = |path: &str| guard_key_for(Path::new(path), true);
+        assert_eq!(
+            key("/System/Volumes/Data/Users/Tobi/src"),
+            PathBuf::from("/users/tobi/src")
+        );
+        assert_eq!(key("/Library/./Caches"), PathBuf::from("/library/caches"));
+        assert_eq!(
+            key("/System/Volumes/Data"),
+            PathBuf::from("/system/volumes/data"),
+            "the Data volume itself stays under /System"
+        );
+        assert_eq!(
+            guard_key_for(Path::new("/Library/X"), false),
+            PathBuf::from("/Library/X"),
+            "Linux paths are compared as spelled"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_guards_see_through_other_spellings() {
+        let home = Path::new("/Users/tobi");
+        let data = Path::new(crate::space::MACOS_DATA_VOLUME);
+        assert!(
+            refuse(
+                &data.join("Users/tobi/src"),
+                data,
+                Some(&Home::of(home)),
+                &[]
+            )
+            .is_none(),
+            "home under the Data volume's name is still home"
+        );
+        let reason = refuse(
+            Path::new("/library/caches"),
+            Path::new("/"),
+            Some(&Home::of(home)),
+            &[],
+        )
+        .expect("refused");
+        assert!(reason.contains("/Library"), "{reason}");
     }
 
     #[test]
@@ -1082,6 +1504,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn detection_prefers_a_tool_this_machine_has() {
         let backend = detect_trash_backend();
         if which("trash-put") {
@@ -1091,33 +1514,91 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
+    fn macos_always_uses_the_system_trash() {
+        // Whatever Homebrew put on PATH: its trash tools write a trash
+        // Finder never shows.
+        assert_eq!(detect_trash_backend(), TrashBackend::MacOs);
+        assert!(TrashBackend::MacOs.is_available());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "puts a file in this Mac's real Trash"]
+    fn the_macos_trash_takes_a_file_and_leaves_a_linked_target() {
+        let temp = TempDir::new().expect("tempdir");
+        let file = temp.path().join("disktree-trash-check.txt");
+        fs::write(&file, b"x").expect("write");
+        let keep = temp.path().join("keep.txt");
+        fs::write(&keep, b"kept").expect("write");
+        let link = temp.path().join("disktree-trash-check-link");
+        std::os::unix::fs::symlink(&keep, &link).expect("symlink");
+
+        move_to_trash(&file, TrashBackend::MacOs).expect("trashed");
+        move_to_trash(&link, TrashBackend::MacOs).expect("trashed");
+
+        assert!(!file.exists());
+        assert!(fs::symlink_metadata(&link).is_err(), "the link went");
+        assert_eq!(fs::read(&keep).expect("read"), b"kept", "not its target");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_name_that_is_not_utf8_is_refused_before_the_trash_sees_it() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let temp = TempDir::new().expect("tempdir");
+        let odd = temp
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"not-\xff-utf8"));
+        let error = trash_via_macos(&odd).expect_err("refused");
+        assert!(error.to_string().contains("UTF-8"), "{error}");
+    }
+
+    #[test]
     fn system_trees_are_refused_in_a_whole_disk_scan() {
         let home = Path::new("/home/tobi");
         assert_eq!(
-            system_tree(Path::new("/usr/lib/libfoo.so"), Some(home)),
+            tree_of(Path::new("/usr/lib/libfoo.so"), home),
             Some("/usr")
         );
         assert_eq!(
-            system_tree(Path::new("/var/lib/pacman"), Some(home)),
+            tree_of(Path::new("/var/lib/pacman"), home),
             Some("/var/lib")
         );
+        assert_eq!(tree_of(Path::new("/var/cache/pacman/pkg"), home), None);
+        assert_eq!(tree_of(Path::new("/opt/thing"), home), None);
         assert_eq!(
-            system_tree(Path::new("/var/cache/pacman/pkg"), Some(home)),
-            None
-        );
-        assert_eq!(system_tree(Path::new("/opt/thing"), Some(home)), None);
-        assert_eq!(
-            system_tree(Path::new("/usrlocal"), Some(home)),
+            tree_of(Path::new("/usrlocal"), home),
             None,
             "components, not prefixes"
         );
         let odd_home = Path::new("/usr/home/tobi");
-        assert_eq!(
-            system_tree(Path::new("/usr/home/tobi/.cache"), Some(odd_home)),
-            None
+        assert_eq!(tree_of(Path::new("/usr/home/tobi/.cache"), odd_home), None);
+        let reason = refuse(
+            Path::new("/etc/hosts"),
+            Path::new("/"),
+            Some(&Home::of(home)),
+            &[],
         );
-        let reason =
-            refuse(Path::new("/etc/hosts"), Path::new("/"), Some(home), &[]);
         assert!(reason.is_some_and(|reason| reason.contains("/etc")));
+    }
+
+    #[test]
+    fn macos_system_trees_are_refused_but_apps_are_not() {
+        let home = Path::new("/Users/tobi");
+        for (path, tree) in [
+            ("/System/Library/Fonts", "/System"),
+            ("/Library/Caches/com.apple.x", "/Library"),
+            ("/private/etc/hosts", "/private"),
+            ("/private/var/folders/xy", "/private"),
+            ("/opt/homebrew/Cellar/git", "/opt/homebrew"),
+        ] {
+            assert_eq!(tree_of(Path::new(path), home), Some(tree));
+        }
+        // An app is uninstalled by moving it to the Trash, and a user's own
+        // Library is theirs.
+        for path in ["/Applications/Xcode.app", "/Users/tobi/Library/Caches"] {
+            assert_eq!(tree_of(Path::new(path), home), None, "{path}");
+        }
     }
 }
