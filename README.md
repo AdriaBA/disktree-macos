@@ -280,8 +280,8 @@ The same program, with Windows' answers to the questions above:
   them.
 - **Hidden** still means a name starting with a dot; the hidden attribute is
   not consulted, so `-H` does not drop `AppData`.
-- **The theme** is gpui-omarchy's default, since there is no Omarchy theme
-  to follow.
+- **The theme** follows Windows' light or dark setting, since there is no
+  Omarchy theme to follow. It does on macOS too, and on GNOME and KDE.
 
 ## What it refuses to do
 
