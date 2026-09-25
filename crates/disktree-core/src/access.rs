@@ -42,8 +42,8 @@ mod tests {
         let temp = tempfile::TempDir::new().expect("tempdir");
         assert_eq!(full_disk_access(temp.path()), None);
         if !cfg!(target_os = "macos") {
-            let home = std::env::var_os("HOME").expect("HOME is set");
-            assert_eq!(full_disk_access(Path::new(&home)), None);
+            let home = std::env::home_dir().expect("a home directory");
+            assert_eq!(full_disk_access(&home), None);
         }
     }
 }

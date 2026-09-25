@@ -886,7 +886,9 @@ fn run(
             Err(io::Error::other(reason))
         } else {
             match mode {
-                RemovalMode::Permanent => remove_permanently(&target.path),
+                RemovalMode::Permanent => {
+                    remove_permanently(&target.path, &plan.root)
+                }
                 RemovalMode::Trash => move_to_trash(&target.path, backend),
             }
         };
@@ -934,12 +936,13 @@ fn mounted(path: &Path, mounts: &[PathBuf]) -> Option<String> {
 /// `O_NOFOLLOW`, and one on a different device or mount stops the removal.
 /// (From tobi/disktree#10.)
 ///
-/// The same goes for the way down to `path`: see [`open_parent`].
+/// The same goes for the way down to `path` from `root`, the scanned root:
+/// see [`open_parent`].
 #[cfg(unix)]
-pub fn remove_permanently(path: &Path) -> io::Result<()> {
+pub fn remove_permanently(path: &Path, root: &Path) -> io::Result<()> {
     use rustix::fs::{AtFlags, FileType, statat, unlinkat};
 
-    let (parent, name) = open_parent(path)?;
+    let (parent, name) = open_parent(path, root)?;
     let stat = statat(&parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
     if FileType::from_raw_mode(stat.st_mode) != FileType::Directory {
         unlinkat(&parent, name, AtFlags::empty())?;
@@ -955,16 +958,19 @@ pub fn remove_permanently(path: &Path) -> io::Result<()> {
 
 /// The directory holding `path`, and `path`'s own name in it.
 ///
-/// Opened one component at a time from `/`, none of them followed if it is
-/// a symlink. The scanned root is canonical, so no marked path has a symlink
-/// on its way down; one that does now was put there after the scan, and
-/// following it would remove whatever it points to — a directory swapped
-/// for a link to `~` would take `~/x` in place of the `/tmp/d/x` that was
-/// marked. `rm -rf` has the same race; this closes it.
+/// Opened one component at a time from `root`, none of them followed if it
+/// is a symlink. The scan does not follow links, so no marked path has one
+/// between the root and itself; one that does now was put there after the
+/// scan, and following it would remove whatever it points to — a directory
+/// swapped for a link to `~` would take `~/x` in place of the `/tmp/d/x`
+/// that was marked. `rm -rf` has the same race; this closes it. Links above
+/// the root are followed: they are how the user named it, and on macOS
+/// `/tmp` and `/var` are links themselves.
 #[cfg(unix)]
-fn open_parent(
-    path: &Path,
-) -> io::Result<(std::os::fd::OwnedFd, &std::ffi::OsStr)> {
+fn open_parent<'a>(
+    path: &'a Path,
+    root: &Path,
+) -> io::Result<(std::os::fd::OwnedFd, &'a std::ffi::OsStr)> {
     use rustix::io::Errno;
 
     let not_marked = || {
@@ -974,11 +980,19 @@ fn open_parent(
         ))
     };
     let name = path.file_name().ok_or_else(not_marked)?;
-    let parent = path.parent().ok_or_else(not_marked)?;
-    let mut dir = open_step(rustix::fs::CWD, "/")?;
-    for component in parent.components() {
+    let below = path
+        .parent()
+        .and_then(|parent| parent.strip_prefix(root).ok())
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "{} is not inside the scanned root {}",
+                path.display(),
+                root.display()
+            ))
+        })?;
+    let mut dir = open_root(root)?;
+    for component in below.components() {
         match component {
-            Component::RootDir => {}
             Component::Normal(part) => {
                 dir = open_step(&dir, part).map_err(|error| match error {
                     Errno::LOOP | Errno::NOTDIR => io::Error::other(format!(
@@ -994,6 +1008,21 @@ fn open_parent(
         }
     }
     Ok((dir, name))
+}
+
+/// Open the scanned root, following links: see [`open_parent`].
+#[cfg(unix)]
+fn open_root(root: &Path) -> rustix::io::Result<std::os::fd::OwnedFd> {
+    use rustix::fs::{Mode, OFlags, open};
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    let access = OFlags::PATH;
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let access = OFlags::RDONLY;
+    open(
+        root,
+        access | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
 }
 
 /// Open a directory on the way down to a target, not following a symlink.
@@ -1018,7 +1047,7 @@ fn open_step<P: rustix::path::Arg>(
 }
 
 #[cfg(not(unix))]
-pub fn remove_permanently(path: &Path) -> io::Result<()> {
+pub fn remove_permanently(path: &Path, _root: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
         fs::remove_dir_all(path)
@@ -1497,6 +1526,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn a_directory_holding_a_system_tree_is_refused() {
         let home = Path::new("/Users/tobi");
@@ -1667,7 +1697,7 @@ mod tests {
         fs::create_dir_all(doomed.join("b/c/d")).expect("mkdir");
         fs::write(doomed.join("b/c/d/.hidden"), "x").expect("write");
         fs::write(doomed.join("b/c/f"), "x").expect("write");
-        remove_permanently(&doomed).expect("remove tree");
+        remove_permanently(&doomed, temp.path()).expect("remove tree");
         assert!(!doomed.exists());
         assert!(temp.path().join("other").exists());
     }
@@ -1678,7 +1708,8 @@ mod tests {
         let outside = TempDir::new().expect("tempdir");
         fs::write(outside.path().join("keep"), "x").expect("write");
         link_dir(outside.path(), &temp.path().join("a/link"));
-        remove_permanently(&temp.path().join("a")).expect("remove tree");
+        remove_permanently(&temp.path().join("a"), temp.path())
+            .expect("remove tree");
         assert!(outside.path().join("keep").exists());
     }
 
@@ -1686,7 +1717,7 @@ mod tests {
     fn permanent_removal_takes_directories_and_leaves_siblings() {
         let temp = tree();
         let doomed = temp.path().join("a/b");
-        remove_permanently(&doomed).expect("remove dir");
+        remove_permanently(&doomed, temp.path()).expect("remove dir");
         assert!(!doomed.exists());
         assert!(temp.path().join("a/c.bin").exists());
     }
@@ -1708,7 +1739,7 @@ mod tests {
         let link = temp.path().join("link");
         link_dir(keep.path(), &link);
 
-        remove_permanently(&link).expect("remove link");
+        remove_permanently(&link, temp.path()).expect("remove link");
         assert!(fs::symlink_metadata(&link).is_err(), "the link is gone");
         assert!(keep.path().join("precious.bin").exists());
     }
@@ -1726,7 +1757,8 @@ mod tests {
         fs::remove_dir_all(temp.path().join("a/b")).expect("clear");
         link_dir(keep.path(), &temp.path().join("a/b"));
 
-        let error = remove_permanently(&marked).expect_err("refused");
+        let error =
+            remove_permanently(&marked, temp.path()).expect_err("refused");
         assert!(error.to_string().contains("changed since"), "{error}");
         assert!(keep.path().join("x/precious.bin").exists());
     }
@@ -1823,6 +1855,20 @@ mod tests {
         }
     }
 
+    /// On macOS the temporary directory is under `/var`, itself a link to
+    /// `/private/var`: a link above the scanned root is how it was named.
+    #[test]
+    fn permanent_removal_follows_links_above_the_root() {
+        let temp = tree();
+        let spelled = TempDir::new().expect("tempdir");
+        let root = spelled.path().join("root");
+        link_dir(temp.path(), &root);
+
+        remove_permanently(&root.join("a/b"), &root).expect("removed");
+        assert!(!temp.path().join("a/b").exists());
+        assert!(temp.path().join("a/one.bin").exists());
+    }
+
     #[test]
     fn a_mount_below_a_target_is_caught_again_at_removal_time() {
         let temp = tree();
@@ -1852,8 +1898,9 @@ mod tests {
         permissions.set_readonly(true);
         fs::set_permissions(&lone, permissions).expect("read-only");
 
-        remove_permanently(&lone).expect("a read-only file");
-        remove_permanently(&temp.path().join("a/b")).expect("a directory");
+        remove_permanently(&lone, temp.path()).expect("a read-only file");
+        remove_permanently(&temp.path().join("a/b"), temp.path())
+            .expect("a directory");
         assert!(!lone.exists());
         assert!(!temp.path().join("a/b").exists());
         assert!(temp.path().join("a/c.bin").exists());
@@ -1862,8 +1909,9 @@ mod tests {
     #[test]
     fn a_missing_target_reports_not_found() {
         let temp = tree();
-        let error = remove_permanently(&temp.path().join("absent"))
-            .expect_err("missing");
+        let error =
+            remove_permanently(&temp.path().join("absent"), temp.path())
+                .expect_err("missing");
         assert_eq!(error.kind(), io::ErrorKind::NotFound);
     }
 
